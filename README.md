@@ -1,0 +1,2 @@
+# girc
+Go IRC server
