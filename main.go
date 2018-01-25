@@ -7,6 +7,8 @@ import "strings" // only needed below for sample processing
 
 func main() {
 
+	printBanner()
+
 	fmt.Println("Launching server...")
 
 	// listen on all interfaces
@@ -26,4 +28,19 @@ func main() {
 		// send new string back to client
 		conn.Write([]byte(newmessage + "\n"))
 	}
+}
+
+func printBanner() {
+	// http://patorjk.com/software/taag/#p=display&f=Rectangles&t=gomanager
+	fmt.Println()
+	fmt.Printf(`
+	Welcome to
+                        _         
+                    ___|_|___ ___ 
+                   | . | |  _|  _|
+                   |_  |_|_| |___|
+                   |___|          `)
+	fmt.Println()
+	fmt.Println()
+	fmt.Println()
 }
