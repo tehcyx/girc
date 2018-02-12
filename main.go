@@ -1,9 +1,11 @@
 package main
 
-import "net"
-import "fmt"
-import "bufio"
-import "strings" // only needed below for sample processing
+import (
+	"fmt"
+	"net"
+
+	"github.com/tehcyx/girc/server"
+)
 
 func main() {
 
@@ -12,26 +14,29 @@ func main() {
 	fmt.Println("Launching server...")
 
 	// listen on all interfaces
-	ln, _ := net.Listen("tcp", ":6665")
+	ln, err := net.Listen("tcp", ":6665")
+	if err != nil {
+		fmt.Printf("Listen failed, port possibly in use already: %s\n", err)
+	}
 
-	// accept connection on port
-	conn, _ := ln.Accept()
+	defer func() {
+		fmt.Printf("Shutting down server. Bye!\n")
+		ln.Close()
+	}()
+
+	server.InitServer()
 
 	// run loop forever (or until ctrl-c)
 	for {
-		// will listen for message to process ending in newline (\n)
-		message, _ := bufio.NewReader(conn).ReadString('\n')
-		// output message received
-		fmt.Print("Message Received:", string(message))
-		// sample process for string received
-		newmessage := strings.ToUpper(message)
-		// send new string back to client
-		conn.Write([]byte(newmessage + "\n"))
+		// accept connection on port
+		conn, _ := ln.Accept()
+
+		server.InitClient(conn)
 	}
 }
 
 func printBanner() {
-	// http://patorjk.com/software/taag/#p=display&f=Rectangles&t=gomanager
+	// http://patorjk.com/software/taag/#p=display&f=Rectangles&t=girc
 	fmt.Println()
 	fmt.Printf(`
 	Welcome to

@@ -8,7 +8,7 @@ Y8b  88   .88.   88 `88. Y8b  d8
 ```
 
 # girc
-IRC server written in Go (project to get hands on Go networking) using sqlite
+IRC server written in Go
 
 # Test Clients
 I'm currently using [Colloquy](http://colloquy.info/) and [Shout](http://shout-irc.com/) to test my functionality.
@@ -16,18 +16,18 @@ I'm currently using [Colloquy](http://colloquy.info/) and [Shout](http://shout-i
 ### Currently Supported Commands
 none
 ### Started working on
-* Connection registration [Connection registration](https://tools.ietf.org/html/rfc1459#section-4.1)
-  * `PASS secretpass` [Password message](https://tools.ietf.org/html/rfc1459#section-4.1.1)
-  * `NICK tehcyx [ <hopcount> ]` [Nick message](https://tools.ietf.org/html/rfc1459#section-4.1.2) - hopcount actually not yet supported
-  * `QUIT [<Quit message>]` [Quit](https://tools.ietf.org/html/rfc1459#section-4.1.6) - Quit message not supported
+* Connection registration [Connection registration](https://tools.ietf.org/html/rfc2812#section-3.1)
+  * `PASS secretpass` [Password message](https://tools.ietf.org/html/rfc2812#section-3.1.1)
+  * `NICK tehcyx [ <hopcount> ]` [Nick message](https://tools.ietf.org/html/rfc2812#section-3.1.2) - hopcount actually not yet supported
+  * `USER <user> <mode> <unused> <realname>` [User message](https://tools.ietf.org/html/rfc2812#section-3.1.3)
+  * `QUIT [<Quit message>]` [Quit](https://tools.ietf.org/html/rfc2812#section-3.1.7) - Quit message not supported
   * more coming soon...
 * Messaging [Sending messages](https://tools.ietf.org/html/rfc1459#section-4.4)
-  * `PRIVMSG tehcyx hello tehcyx` [Private messages](https://tools.ietf.org/html/rfc1459#section-4.4.1)
-  * `NOTICE tehcyx hello tehcyx` [Notice](https://tools.ietf.org/html/rfc1459#section-4.4.2)
+  * `PRIVMSG tehcyx hello tehcyx` [Private messages](https://tools.ietf.org/html/rfc2812#section-3.3.1)
+  * `NOTICE tehcyx hello tehcyx` [Notice](https://tools.ietf.org/html/rfc2812#section-3.3.2)
 
 ### Upcoming Features
 * Connection registration [Connection registration](https://tools.ietf.org/html/rfc1459#section-4.1)
-  * `USER <username> <hostname> <servername> <realname>` [User message](https://tools.ietf.org/html/rfc1459#section-4.1.3)
   * `OPER <user> <password>` [Oper](https://tools.ietf.org/html/rfc1459#section-4.1.5)
 * Channel operations [Channel operations](https://tools.ietf.org/html/rfc1459#section-4.2)
   * `JOIN <channel>{,<channel>} [<key>{,<key>}]` [Join message](https://tools.ietf.org/html/rfc1459#section-4.2.1)
@@ -42,4 +42,4 @@ none
 * `SQUIT <server> <comment>` [Server quit message](https://tools.ietf.org/html/rfc1459#section-4.1.7)
 
 # RFCs used
-* [RFC1459](https://tools.ietf.org/html/rfc1459)
+* [RFC1459](https://tools.ietf.org/html/rfc2812)
