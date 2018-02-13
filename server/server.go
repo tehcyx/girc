@@ -167,15 +167,15 @@ func clientHandleConnect(conn net.Conn) {
 			} else if cmd == NickCmd && len(args) != 0 && !pass {
 				// Command: NICK Parameters: <nickname> [ <hopcount> ]
 				if len(args) == 0 {
-					errMsg := fmt.Sprintf("%s :No nickname given\n", ErrNickNull)
+					errMsg := fmt.Sprintf(":%s %s :No nickname given\n", serverHost, ErrNickNull)
 					fmt.Printf(">> %s", errMsg)
 					conn.Write([]byte(errMsg))
 				} else if connectedClientList.contains(args) {
-					errMsg := fmt.Sprintf("%s * %s :Nickname is already in use\n", ErrNickInUse, args)
+					errMsg := fmt.Sprintf(":%s %s * %s :Nickname is already in use\n", serverHost, ErrNickInUse, args)
 					fmt.Printf(">> %s", errMsg)
 					conn.Write([]byte(errMsg))
 				} else if !validCharset(args) {
-					errMsg := fmt.Sprintf("%s * %s :Erroneous nickname\n", ErrNickInvalid, args)
+					errMsg := fmt.Sprintf(":%s %s * %s :Erroneous nickname\n", serverHost, ErrNickInvalid, args)
 					fmt.Printf(">> %s", errMsg)
 					conn.Write([]byte(errMsg))
 				} else {
@@ -188,17 +188,17 @@ func clientHandleConnect(conn net.Conn) {
 				// Command: USER Parameters: <user> <mode> <unused> <realname>
 				// Example: USER shout-user 0 * :Shout User
 				if len(args) == 0 {
-					errMsg := fmt.Sprintf("%s :You may not reregister\n", ErrAlreadyRegistered)
+					errMsg := fmt.Sprintf(":%s %s :You may not reregister\n", serverHost, ErrAlreadyRegistered)
 					fmt.Printf(">> %s", errMsg)
 					conn.Write([]byte(errMsg))
 				} else {
 					split := strings.Split(args, ":")
 					if len(split) < 2 {
-						errMsg := fmt.Sprintf("%s USER :Not enough parameters\n", ErrNeedMoreParams)
+						errMsg := fmt.Sprintf(":%s %s USER :Not enough parameters\n", serverHost, ErrNeedMoreParams)
 						fmt.Printf(">> %s", errMsg)
 						conn.Write([]byte(errMsg))
 					} else if len(strings.Split(split[0], " ")) < 3 {
-						errMsg := fmt.Sprintf("%s USER :Not enough parameters\n", ErrNeedMoreParams)
+						errMsg := fmt.Sprintf(":%s %s USER :Not enough parameters\n", serverHost, ErrNeedMoreParams)
 						fmt.Printf(">> %s", errMsg)
 						conn.Write([]byte(errMsg))
 					} else {
@@ -213,19 +213,19 @@ func clientHandleConnect(conn net.Conn) {
 				}
 			} else if cmd == PingCmd && len(args) != 0 && initHappened {
 				if len(args) == 0 {
-					errMsg := fmt.Sprintf("%s :No origin specified\n", ErrNoOrigin)
+					errMsg := fmt.Sprintf(":%s %s :No origin specified\n", serverHost, ErrNoOrigin)
 					fmt.Printf(">> %s", errMsg)
 					conn.Write([]byte(errMsg))
 				} else {
 					origins := strings.Split(args, " ")
 					if len(origins) == 1 {
-						answerMsg := fmt.Sprintf("%s %s\n", PingPongCmd, args)
+						answerMsg := fmt.Sprintf(":%s %s %s\n", serverHost, PingPongCmd, args)
 						fmt.Printf(">> %s", answerMsg)
 						conn.Write([]byte(answerMsg))
 					} else {
 						// query other server as well for now just answer
 						// ...
-						answerMsg := fmt.Sprintf("%s %s\n", PingPongCmd, args)
+						answerMsg := fmt.Sprintf(":%s %s %s\n", serverHost, PingPongCmd, args)
 						fmt.Printf(">> %s", answerMsg)
 						conn.Write([]byte(answerMsg))
 					}
@@ -258,7 +258,7 @@ func clientReadConnectPass(args string) string {
 func clientInit(client *Client) {
 	connectedClientList.add(*client)
 
-	welcomeMessage := fmt.Sprintf("%s :Welcome to 'girc v%s' %s!%s@%s\n", RplWelcome, Version(), client.nick, client.user, serverHost)
+	welcomeMessage := fmt.Sprintf(":%s %s :Welcome to 'girc v%s' %s!%s@%s\n", serverHost, RplWelcome, Version(), client.nick, client.user, serverHost)
 	fmt.Printf(">> %s", welcomeMessage)
 	client.conn.Write([]byte(welcomeMessage))
 
@@ -272,6 +272,7 @@ func clientJoinRoom(client *Client, roomName string) {
 	if strings.ContainsAny(roomName, "#") {
 		roomName = roomName[1:]
 	}
+
 	var room *Room
 	for _, r := range roomList {
 		if strings.Compare(r.name, roomName) == 0 {
@@ -290,8 +291,8 @@ func clientJoinRoom(client *Client, roomName string) {
 	room.clients[client.identifier] = true
 	client.rooms[room.identifier] = true
 	// send to all existing clients + user, that user has joined:
-	message := fmt.Sprintf(":%s!%s@%s %s #%s", client.nick, client.user, serverHost, "JOIN", room.name)
-	fmt.Println(message)
+	message := fmt.Sprintf(":%s!%s@%s %s #%s\n", client.nick, client.user, serverHost, "JOIN", room.name)
+	fmt.Printf(">> %s", message)
 	var names []string
 	for ident, _ := range room.clients {
 		for _, cli := range connectedClientList.clients {
@@ -302,18 +303,21 @@ func clientJoinRoom(client *Client, roomName string) {
 		}
 	}
 
-	if room.topic != "" {
-		message = fmt.Sprintf("%s %s :No topic is set\n", RplTopic, room.name, room.topic)
+	if room.topic == "" {
+		message = fmt.Sprintf(":%s %s %s #%s :No topic is set\n", serverHost, RplTopic, client.nick, room.name)
 	} else {
-		message = fmt.Sprintf("%s %s :%s\n", RplNoTopic, room.name, room.topic)
+		message = fmt.Sprintf(":%s %s %s #%s :%s\n", serverHost, RplNoTopic, client.nick, room.name, room.topic)
 	}
+	fmt.Printf(">> %s", message)
 	client.conn.Write([]byte(message))
 
 	// send list of all clients in room to user
 	// "( "=" / "*" / "@" ) <channel> :[ "@" / "+" ] <nick> *( " " [ "@" / "+" ] <nick> )
-	message = fmt.Sprintf("%s =%s :%s\n", RplNameReply, room.name, strings.Join(names[:], " "))
+	message = fmt.Sprintf(":%s %s %s = #%s :%s\n", serverHost, RplNameReply, client.nick, room.name, strings.Join(names[:], " "))
+	fmt.Printf(">> %s", message)
 	client.conn.Write([]byte(message))
-	message = fmt.Sprintf("%s %s :End of NAMES list\n", RplEndOfNames, room.name)
+	message = fmt.Sprintf(":%s %s %s #%s :End of NAMES list\n", serverHost, RplEndOfNames, client.nick, room.name)
+	fmt.Printf(">> %s", message)
 	client.conn.Write([]byte(message))
 }
 

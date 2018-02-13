@@ -43,3 +43,6 @@ none
 
 # RFCs used
 * [RFC1459](https://tools.ietf.org/html/rfc2812)
+
+# Other
+* [IRC Examples](http://chi.cs.uchicago.edu/chirc/irc_examples.html)
