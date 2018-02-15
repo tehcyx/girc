@@ -46,3 +46,7 @@ none
 
 # Other
 * [IRC Examples](http://chi.cs.uchicago.edu/chirc/irc_examples.html)
+* [Go Concurrency](https://tour.golang.org/concurrency/9)
+* [Go Testing](https://golang.org/pkg/testing/)
+* [Go Package Names](https://blog.golang.org/package-names)
+* [Go Documentation](https://blog.golang.org/godoc-documenting-go-code)
