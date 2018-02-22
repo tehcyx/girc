@@ -49,13 +49,13 @@ type Room struct {
 	name       string
 	topic      string
 	clients    map[uuid.UUID]bool
-	roomMutex  *sync.Mutex
+	roomMux    *sync.Mutex
 }
 
 // RoomsList struct holding a []Room and a sync.Mutex to modify the array.
 type RoomsList struct {
-	list      []Room
-	listMutex *sync.Mutex
+	list    []Room
+	listMux *sync.Mutex
 }
 
 const (
@@ -128,9 +128,10 @@ func InitServer() {
 
 func initRoomList() {
 	rooms = *new(RoomsList)
+	rooms.listMux = &sync.Mutex{}
 	rooms.list = []Room{}
-	rooms.listMutex.Lock()
-	defer rooms.listMutex.Unlock()
+	rooms.listMux.Lock()
+	defer rooms.listMux.Unlock()
 
 	// create lobby
 	roomID, err := uuid.NewRandom()
@@ -138,6 +139,7 @@ func initRoomList() {
 		log.Fatal("Could not create node identifier")
 	}
 	lobby = &Room{}
+	lobby.roomMux = &sync.Mutex{}
 	lobby.identifier = roomID
 	lobby.name = "lobby"
 	lobby.clients = make(map[uuid.UUID]bool)
@@ -147,6 +149,7 @@ func initRoomList() {
 
 func initClientList() {
 	connectedClientList = *new(ClientList)
+	connectedClientList.clientsMux = &sync.Mutex{}
 }
 
 func clientHandleConnect(conn net.Conn) {
@@ -161,6 +164,7 @@ func clientHandleConnect(conn net.Conn) {
 	// error := false
 
 	newClient := new(Client)
+	newClient.clientMux = &sync.Mutex{}
 	newClient.identifier = clientIdentifier
 	newClient.conn = conn
 	newClient.rooms = make(map[uuid.UUID]bool)
@@ -289,7 +293,7 @@ func clientHandleConnect(conn net.Conn) {
 							// ERR_TOOMANYTARGETS
 						} else {
 							if inChannel, room := isUserInChannel(newClient, target); inChannel {
-								room.roomMutex.Lock()
+								room.roomMux.Lock()
 								for ident := range room.clients {
 									if ident == newClient.identifier {
 										continue
@@ -300,7 +304,7 @@ func clientHandleConnect(conn net.Conn) {
 										}
 									}
 								}
-								room.roomMutex.Unlock()
+								room.roomMux.Unlock()
 							} else {
 								send(conn, ":%s %s %s :Cannot send to channel\n", serverHost, ErrCannotSendToChan, target)
 							}
@@ -326,7 +330,7 @@ func clientHandleConnect(conn net.Conn) {
 					for _, target := range partTargets {
 						if channelExists(target) {
 							if inChannel, room := isUserInChannel(newClient, target); inChannel {
-								room.roomMutex.Lock()
+								room.roomMux.Lock()
 								for ident := range room.clients {
 									if ident == newClient.identifier {
 										continue
@@ -337,7 +341,7 @@ func clientHandleConnect(conn net.Conn) {
 										}
 									}
 								}
-								room.roomMutex.Unlock()
+								room.roomMux.Unlock()
 							} else {
 								send(conn, ":%s %s %s :You're not on that channel\n", serverHost, ErrNotOnChannel, target)
 							}
@@ -352,8 +356,8 @@ func clientHandleConnect(conn net.Conn) {
 }
 
 func channelExists(roomName string) bool {
-	rooms.listMutex.Lock()
-	defer rooms.listMutex.Unlock()
+	rooms.listMux.Lock()
+	defer rooms.listMux.Unlock()
 
 	for _, room := range rooms.list {
 		if strings.Compare(room.name, roomName) == 0 {
@@ -384,7 +388,7 @@ func clientReadConnectPass(args string) string {
 func clientInit(client *Client) {
 	connectedClientList.add(*client)
 
-	send(client.conn, ":%s %s :Welcome to 'girc v%s' %s!%s@%s\n", serverHost, RplWelcome, Version(), client.nick, client.user, serverHost)
+	send(client.conn, ":%s %s :Welcome to the Internet Relay Network %s!%s@%s\n", serverHost, RplWelcome, client.nick, client.user, serverHost)
 
 	clientJoinRoom(client, lobby.name)
 }
@@ -398,8 +402,8 @@ func clientJoinRoom(client *Client, roomName string) {
 	}
 
 	var room *Room
-	rooms.listMutex.Lock()
-	defer rooms.listMutex.Unlock()
+	rooms.listMux.Lock()
+	defer rooms.listMux.Unlock()
 	for _, r := range rooms.list {
 		if strings.Compare(r.name, roomName) == 0 {
 			room = &r
@@ -412,6 +416,7 @@ func clientJoinRoom(client *Client, roomName string) {
 			log.Fatal("Could not create node identifier")
 		}
 		room = &Room{}
+		room.roomMux = &sync.Mutex{}
 		room.identifier = roomID
 		room.name = roomName
 		room.clients = make(map[uuid.UUID]bool)
@@ -419,8 +424,8 @@ func clientJoinRoom(client *Client, roomName string) {
 		rooms.list = append(rooms.list, *room)
 	}
 
-	room.roomMutex.Lock()
-	defer room.roomMutex.Unlock()
+	room.roomMux.Lock()
+	defer room.roomMux.Unlock()
 
 	room.clients[client.identifier] = true
 	client.rooms[room.identifier] = true
@@ -526,8 +531,8 @@ func isUserInChannel(client *Client, roomName string) (bool, *Room) {
 	if strings.HasPrefix(roomName, "#") {
 		compareRoomName = roomName[1:]
 	}
-	rooms.listMutex.Lock()
-	defer rooms.listMutex.Unlock()
+	rooms.listMux.Lock()
+	defer rooms.listMux.Unlock()
 
 	for _, room := range rooms.list {
 		if strings.Compare(room.name, compareRoomName) == 0 {
