@@ -43,7 +43,7 @@ I'm currently using [Colloquy](http://colloquy.info/) and [Shout](http://shout-i
 * `SQUIT <server> <comment>` [Server quit message](https://tools.ietf.org/html/rfc1459#section-4.1.7)
 
 # RFC
-* [RFC1459](https://tools.ietf.org/html/rfc2812)
+* [RFC2812](https://tools.ietf.org/html/rfc2812)
 
 # Inspiring reads
 * [IRC Examples](http://chi.cs.uchicago.edu/chirc/irc_examples.html)
