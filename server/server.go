@@ -34,13 +34,13 @@ type Client struct {
 	rooms      map[uuid.UUID]bool
 	thread     chan int
 	conn       net.Conn
-	clientMux  sync.Mutex
+	clientMux  *sync.Mutex
 }
 
 // ClientList struct holding a []Client and a sync.Mutex to modify the array.
 type ClientList struct {
 	clients    []Client
-	clientsMux sync.Mutex
+	clientsMux *sync.Mutex
 }
 
 // Room struct holding info about created a room.
@@ -49,21 +49,26 @@ type Room struct {
 	name       string
 	topic      string
 	clients    map[uuid.UUID]bool
-	roomMutex  sync.Mutex
+	roomMutex  *sync.Mutex
 }
 
 // RoomsList struct holding a []Room and a sync.Mutex to modify the array.
 type RoomsList struct {
 	list      []Room
-	listMutex sync.Mutex
+	listMutex *sync.Mutex
 }
 
 const (
 	// Registration commands
+	// PassCmd `PASS secretpass` [Password message](https://tools.ietf.org/html/rfc2812#section-3.1.1)
 	PassCmd = "PASS"
+	// NickCmd `NICK tehcyx [ <hopcount> ]` [Nick message](https://tools.ietf.org/html/rfc2812#section-3.1.2) - hopcount actually not yet supported
 	NickCmd = "NICK"
+	// UserCmd `USER <user> <mode> <unused> <realname>` [User message](https://tools.ietf.org/html/rfc2812#section-3.1.3)
 	UserCmd = "USER"
+	// QuitCmd `QUIT [<Quit message>]` [Quit](https://tools.ietf.org/html/rfc2812#section-3.1.7) - Quit message not
 	QuitCmd = "QUIT"
+	// !Registration commands
 
 	// Error commands
 	ErrNoSuchNick        = "401"
@@ -79,16 +84,19 @@ const (
 	ErrNotOnChannel      = "442"
 	ErrNeedMoreParams    = "461" // <command> :Not enough parameters
 	ErrAlreadyRegistered = "462" // :You may not reregister
+	// !Error commands
 
-	// client commands
+	// Client commands
 	PrivmsgCmd = "PRIVMSG"
 	NoticeCmd  = "NOTICE"
 	PingCmd    = "PING"
 	JoinCmd    = "JOIN"
 	PartCmd    = "PART"
+	// !Client commands
 
-	// server responses
+	// Server responses
 	PingPongCmd = "PONG"
+	// !Server responses
 
 	// Command Responses
 	RplWelcome    = "001"
@@ -282,7 +290,7 @@ func clientHandleConnect(conn net.Conn) {
 						} else {
 							if inChannel, room := isUserInChannel(newClient, target); inChannel {
 								room.roomMutex.Lock()
-								for ident, _ := range room.clients {
+								for ident := range room.clients {
 									if ident == newClient.identifier {
 										continue
 									}
@@ -319,7 +327,7 @@ func clientHandleConnect(conn net.Conn) {
 						if channelExists(target) {
 							if inChannel, room := isUserInChannel(newClient, target); inChannel {
 								room.roomMutex.Lock()
-								for ident, _ := range room.clients {
+								for ident := range room.clients {
 									if ident == newClient.identifier {
 										continue
 									}
@@ -418,7 +426,7 @@ func clientJoinRoom(client *Client, roomName string) {
 	client.rooms[room.identifier] = true
 	// send to all existing clients + user, that user has joined:
 	var names []string
-	for ident, _ := range room.clients {
+	for ident := range room.clients {
 		for _, cli := range connectedClientList.clients {
 			if ident == cli.identifier {
 				send(cli.conn, ":%s!%s@%s %s #%s\n", client.nick, client.user, serverHost, JoinCmd, room.name)
