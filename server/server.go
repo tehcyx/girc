@@ -23,6 +23,7 @@ const serverPatchVersion = 1
 const serverName = "girc.rothdaniel.de"
 const serverHost = "localhost"
 
+// Client struct holding info about connected client.
 type Client struct {
 	identifier uuid.UUID
 	nick       string
@@ -36,11 +37,13 @@ type Client struct {
 	clientMux  sync.Mutex
 }
 
+// ClientList struct holding a []Client and a sync.Mutex to modify the array.
 type ClientList struct {
 	clients    []Client
 	clientsMux sync.Mutex
 }
 
+// Room struct holding info about created a room.
 type Room struct {
 	identifier uuid.UUID
 	name       string
@@ -49,6 +52,7 @@ type Room struct {
 	roomMutex  sync.Mutex
 }
 
+// RoomsList struct holding a []Room and a sync.Mutex to modify the array.
 type RoomsList struct {
 	list      []Room
 	listMutex sync.Mutex
@@ -102,10 +106,13 @@ var connectedClientList ClientList
 var rooms RoomsList
 var lobby *Room
 
+// InitClient initializes a client connection to run in a different thread.
 func InitClient(conn net.Conn) {
 	go clientHandleConnect(conn)
 }
 
+// InitServer initializes the server, creating an empty list of clients
+// and a room list that contains just the lobby for now.
 func InitServer() {
 	initClientList()
 	initRoomList()
@@ -171,6 +178,7 @@ func clientHandleConnect(conn net.Conn) {
 		conn.SetReadDeadline(time.Now().Add(timeoutDuration))
 
 		reader := bufio.NewReader(conn)
+		// TODO https://twitter.com/davecheney/status/604837853344989184?lang=en
 		message, err := reader.ReadString('\n') // there's a problem with clients that send multiple lines, will have to figure out a solution using the scanner API
 
 		if err != nil {
@@ -523,6 +531,7 @@ func isUserInChannel(client *Client, roomName string) (bool, *Room) {
 	return false, nil
 }
 
+// Version returns the version number
 func Version() string {
 	return fmt.Sprintf("%d.%d.%d", serverMajorVersion, serverMinorVersion, serverPatchVersion)
 }
