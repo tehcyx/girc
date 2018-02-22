@@ -1,5 +1,5 @@
 FROM scratch
 
-ADD gircdocker /
+ADD bin/appdocker /
 
-CMD ["/gircdocker"]
+CMD ["/appdocker"]

@@ -1,10 +1,10 @@
-default: builddocker
+default: build
 
-buildgo:
-	go build -i
+build: test cover
+	go build -i -o bin/app
 
-builddocker:
-	CGO_ENABLED=0 GOOS=linux go build -ldflags "-s" -a -installsuffix cgo -o gircdocker
+docker:
+	CGO_ENABLED=0 GOOS=linux go build -ldflags "-s" -a -installsuffix cgo -o bin/appdocker
 	docker build -t girc .
 
 run:
@@ -14,4 +14,7 @@ test:
 	go test ./...
 
 cover:
-	go test ./.. -cover
+	go test ./... -cover
+
+clean:
+	rm -rf bin
