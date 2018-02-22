@@ -170,7 +170,8 @@ func clientHandleConnect(conn net.Conn) {
 		// is received after deadline.
 		conn.SetReadDeadline(time.Now().Add(timeoutDuration))
 
-		message, err := bufio.NewReader(conn).ReadString('\n')
+		reader := bufio.NewReader(conn)
+		message, err := reader.ReadString('\n') // there's a problem with clients that send multiple lines, will have to figure out a solution using the scanner API
 
 		if err != nil {
 			fmt.Printf("An error occured, now closing connection to client socket. Error: %s\n", err)
