@@ -47,6 +47,7 @@ I'm currently using [Colloquy](http://colloquy.info/) and [Shout](http://shout-i
 
 # Inspiring reads
 * [IRC Examples](http://chi.cs.uchicago.edu/chirc/irc_examples.html)
+* [Modern IRC ...](https://modern.ircdocs.horse/)
 * [Go Concurrency](https://tour.golang.org/concurrency/9)
 * [Go Testing](https://golang.org/pkg/testing/)
 * [Go Package Names](https://blog.golang.org/package-names)

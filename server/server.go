@@ -176,7 +176,7 @@ func clientHandleConnect(conn net.Conn) {
 		_, err := conn.Read(make([]byte, 0))
 		if err != io.EOF {
 			// this connection is invalid
-			fmt.Printf("Client hung up unexpectedly ...\n")
+			fmt.Printf("Client hung up unexpectedly or quit ...\n")
 		} else {
 			fmt.Printf("Client quit or inactive, closing connection ...\n")
 			conn.Close()
@@ -306,14 +306,14 @@ func clientHandleConnect(conn net.Conn) {
 								}
 								room.roomMux.Unlock()
 							} else {
-								send(conn, ":%s %s %s :Cannot send to channel\n", serverHost, ErrCannotSendToChan, target)
+								send(conn, ":%s %s %s %s :Cannot send to channel\n", serverHost, ErrCannotSendToChan, newClient.nick, target)
 							}
 						}
 					} else if validNickCharset(target) {
 						// not a channel or mask, let's find out if the requested user is connected
 						targetClient := connectedClientList.getClientByName(target)
 						if targetClient == nil {
-							send(conn, ":%s %s %s :No such nick/channel\n", serverHost, ErrNoSuchNick, target)
+							send(conn, ":%s %s %s %s :No such nick/channel\n", serverHost, ErrNoSuchNick, newClient.nick, target)
 						} else {
 							send(targetClient.conn, ":%s!%s@%s %s %s :%s\n", newClient.nick, newClient.user, serverHost, PrivmsgCmd, target, chatMessage)
 						}
@@ -331,17 +331,22 @@ func clientHandleConnect(conn net.Conn) {
 						if channelExists(target) {
 							if inChannel, room := isUserInChannel(newClient, target); inChannel {
 								room.roomMux.Lock()
+								defer room.roomMux.Unlock()
 								for ident := range room.clients {
-									if ident == newClient.identifier {
+									fmt.Printf("exists %d, %s, %s, %s\n", 2, room.name, ident, newClient.identifier)
+									if ident != newClient.identifier {
 										continue
 									}
 									for _, cli := range connectedClientList.clients {
+										send(cli.conn, ":%s!%s@%s %s %s :%s\n", newClient.nick, newClient.user, serverHost, PartCmd, target, partMessage)
 										if ident == cli.identifier {
-											send(cli.conn, ":%s!%s@%s %s %s :%s\n", newClient.nick, newClient.user, serverHost, PartCmd, target, partMessage)
+											delete(room.clients, newClient.identifier) // remove user from room
+											newClient.clientMux.Lock()
+											defer newClient.clientMux.Unlock()
+											delete(newClient.rooms, room.identifier) // remove room from users rooms list
 										}
 									}
 								}
-								room.roomMux.Unlock()
 							} else {
 								send(conn, ":%s %s %s :You're not on that channel\n", serverHost, ErrNotOnChannel, target)
 							}
@@ -358,6 +363,10 @@ func clientHandleConnect(conn net.Conn) {
 func channelExists(roomName string) bool {
 	rooms.listMux.Lock()
 	defer rooms.listMux.Unlock()
+
+	if strings.HasPrefix(roomName, "#") {
+		roomName = roomName[1:]
+	}
 
 	for _, room := range rooms.list {
 		if strings.Compare(room.name, roomName) == 0 {
@@ -388,7 +397,9 @@ func clientReadConnectPass(args string) string {
 func clientInit(client *Client) {
 	connectedClientList.add(*client)
 
-	send(client.conn, ":%s %s :Welcome to the Internet Relay Network %s!%s@%s\n", serverHost, RplWelcome, client.nick, client.user, serverHost)
+	send(client.conn, ":%s %s %s :Welcome to the Internet Relay Network %s!%s@%s\n", serverHost, RplWelcome, client.nick, client.nick, client.user, serverHost)
+	send(client.conn, ":%s %s %s :Your host is %s, running version %s\n", serverHost, RplYourHost, client.nick, serverHost, Version())
+	send(client.conn, ":%s %s %s :This server was created %s\n", serverHost, RplCreated, client.nick, time.Now().String())
 
 	clientJoinRoom(client, lobby.name)
 }
