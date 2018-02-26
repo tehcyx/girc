@@ -232,13 +232,11 @@ func clientHandleConnect(conn net.Conn) {
 				// Command: USER Parameters: <user> <mode> <unused> <realname>
 				// Example: USER shout-user 0 * :Shout User
 				if len(args) == 0 {
-					send(conn, ":%s %s :You may not reregister\n", serverHost, ErrAlreadyRegistered)
+					send(conn, ":%s %s %s:You may not reregister\n", serverHost, ErrAlreadyRegistered, newClient.nick)
 				} else {
 					split := strings.Split(args, ":")
-					if len(split) < 2 {
-						send(conn, ":%s %s USER :Not enough parameters\n", serverHost, ErrNeedMoreParams)
-					} else if len(strings.Split(split[0], " ")) < 3 {
-						send(conn, ":%s %s USER :Not enough parameters\n", serverHost, ErrNeedMoreParams)
+					if len(split) < 2 || len(strings.Split(split[0], " ")) < 3 {
+						send(conn, ":%s %s %s USER :Not enough parameters\n", serverHost, ErrNeedMoreParams, newClient.nick)
 					} else {
 						args1 := split[0]
 						args2 := split[1]
