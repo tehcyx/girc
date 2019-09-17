@@ -11,5 +11,5 @@ jobs:
     - uses: actions/checkout@v1
     - name: run make, then build docker
       run:  |
-        make
+        make docker
         docker build -t girc .
