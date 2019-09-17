@@ -13,9 +13,9 @@ jobs:
       run:  |
         make docker
         docker build -t girc .
+    - uses: actions/docker/login@master
     - name: Log in to registry
-        uses: actions/docker/login@master
-        env:
-          DOCKER_REGISTRY_URL: docker.pkg.github.com
-          DOCKER_USERNAME: ${{ github.actor }}
-          DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      env:
+        DOCKER_REGISTRY_URL: docker.pkg.github.com
+        DOCKER_USERNAME: ${{ github.actor }}
+        DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
