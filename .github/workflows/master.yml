@@ -15,11 +15,25 @@ jobs:
         DOCKER_USERNAME: ${{ secrets.GITHUB_DOCKER_USERNAME }}
         DOCKER_PASSWORD: ${{ secrets.GITHUB_DOCKER_PASSWORD }}
 
+    - name: tests
+      run: make test
+
+    - name: coverage
+      run: make cover
+
     - name: run make, then build docker
       run:  |
-        # get current commit hash
-        commit=$(git rev-parse HEAD)
         make docker
         docker build -t girc .
+
+    - name: tag image
+      run: |
+        # get current commit hash
+        commit=$(git rev-parse HEAD)
+        docker tag girc:latest docker.pkg.github.com/tehcyx/girc/app:latest
         docker tag girc:latest "docker.pkg.github.com/tehcyx/girc/app:${commit}"
+
+    - name: push image
+      run: |
         docker push "docker.pkg.github.com/tehcyx/girc/app:${commit}"
+        docker push docker.pkg.github.com/tehcyx/girc/app:latest
