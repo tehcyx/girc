@@ -9,13 +9,17 @@ jobs:
     
     steps:
     - uses: actions/checkout@v1
+    - name: Login to GitHub Docker Registry
+      run: docker login docker.pkg.github.com --username $DOCKER_USERNAME --password $DOCKER_PASSWORD
+      env:
+        DOCKER_USERNAME: ${{ secrets.GITHUB_DOCKER_USERNAME }}
+        DOCKER_PASSWORD: ${{ secrets.GITHUB_DOCKER_PASSWORD }}
+
     - name: run make, then build docker
       run:  |
+        # get current commit hash
+        commit=$(git rev-parse HEAD)
         make docker
         docker build -t girc .
-    - uses: actions/docker/login@master
-    - name: Log in to registry
-      env:
-        DOCKER_REGISTRY_URL: docker.pkg.github.com
-        DOCKER_USERNAME: ${{ github.actor }}
-        DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        docker tag girc:latest "docker.pkg.github.com/tehcyx/girc/app:${commit}"
+        docker push "docker.pkg.github.com/tehcyx/girc/app:${commit}"
