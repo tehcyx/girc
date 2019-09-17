@@ -35,5 +35,7 @@ jobs:
 
     - name: push image
       run: |
+        # get current commit hash
+        commit=$(git rev-parse HEAD)
         docker push "docker.pkg.github.com/tehcyx/girc/app:${commit}"
         docker push docker.pkg.github.com/tehcyx/girc/app:latest
