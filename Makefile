@@ -7,7 +7,7 @@ docker:
 	CGO_ENABLED=0 GOOS=linux go build -ldflags "-s" -a -installsuffix cgo -o bin/appdocker
 	docker build -t girc .
 
-run:
+run: docker
 	docker run --rm -p 6665:6665 girc
 
 test:
