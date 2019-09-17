@@ -8,7 +8,7 @@ Y8b  88   .88.   88 `88. Y8b  d8
 ```
 
 # girc
-IRC server written in Go.
+IRC server written in Golang.
 
 [circ](https://github.com/tehcyx/circ) is trying to do the same with C, but I have to update the protocol version.
 
