@@ -1,0 +1,8 @@
+FROM golang:latest
+WORKDIR /girc
+ADD . /girc
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s" -a -installsuffix cgo -o bin/appdocker
+
+FROM scratch
+COPY --from=0 /girc/bin/appdocker .
+CMD ["./appdocker"]
