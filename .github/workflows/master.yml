@@ -9,8 +9,33 @@ jobs:
     
     steps:
     - uses: actions/checkout@v1
-    - name: run make
-      run: make
-    - name: Run a multi-line script
-      run: |
+    - name: Login to GitHub Docker Registry
+      run: docker login docker.pkg.github.com --username $DOCKER_USERNAME --password $DOCKER_PASSWORD
+      env:
+        DOCKER_USERNAME: ${{ secrets.GITHUB_DOCKER_USERNAME }}
+        DOCKER_PASSWORD: ${{ secrets.GITHUB_DOCKER_PASSWORD }}
+
+    - name: tests
+      run: make test
+
+    - name: coverage
+      run: make cover
+
+    - name: run make, then build docker
+      run:  |
+        make docker
         docker build -t girc .
+
+    - name: tag image
+      run: |
+        # get current commit hash
+        commit=$(git rev-parse HEAD)
+        docker tag girc:latest docker.pkg.github.com/tehcyx/girc/app:latest
+        docker tag girc:latest "docker.pkg.github.com/tehcyx/girc/app:${commit}"
+
+    - name: push image
+      run: |
+        # get current commit hash
+        commit=$(git rev-parse HEAD)
+        docker push docker.pkg.github.com/tehcyx/girc/app:latest
+        docker push "docker.pkg.github.com/tehcyx/girc/app:${commit}"
