@@ -5,6 +5,5 @@ import (
 )
 
 func main() {
-
-	ircSrv := server.New()
+	server.New()
 }
