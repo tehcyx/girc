@@ -29,7 +29,21 @@ type Server struct {
 	ClientTimeout time.Duration
 }
 
-func New() *Server {
+//New creates a new server, listening on the defined port and starting to accept client connections
+func New() {
+	log.Println("Launching server...")
+
+	// listen on all interfaces
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", config.Values.Server.Port))
+	if err != nil {
+		log.Error(fmt.Errorf("listen failed, port possibly in use already: %w", err))
+	}
+
+	defer func() {
+		log.Printf("Shutting down server. Bye!\n")
+		ln.Close()
+	}()
+
 	srv := &Server{
 		Clients:      []Client{},
 		ClientsMutex: &sync.Mutex{},
@@ -42,7 +56,13 @@ func New() *Server {
 
 	srv.initRooms()
 
-	return srv
+	// run loop forever (or until ctrl-c)
+	for {
+		// accept connection on port
+		conn, _ := ln.Accept()
+
+		go srv.handleClientConnect(conn)
+	}
 }
 
 func (s *Server) initRooms() {
@@ -53,10 +73,6 @@ func (s *Server) initRooms() {
 
 	s.Rooms = append(s.Rooms, lobby)
 	s.Lobby = &lobby
-}
-
-func (s *Server) HandleClient(conn net.Conn) {
-	go s.handleClientConnect(conn)
 }
 
 func (s *Server) handleClientConnect(conn net.Conn) {
