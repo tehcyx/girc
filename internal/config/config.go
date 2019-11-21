@@ -1,23 +1,21 @@
-package main
+package config
 
 import (
 	"fmt"
 	"io/ioutil"
-	"net"
+	"log"
 	"os"
 	"os/user"
 
-	log "github.com/sirupsen/logrus"
-
-	"github.com/tehcyx/girc/server"
 	yaml "gopkg.in/yaml.v3"
 )
 
-var conf *Config
+var Values *Config
 
 type Config struct {
 	Server struct {
 		Name string `yaml:"name"`
+		Host string `yaml:"host"`
 		Port string `yaml:"port"`
 		Motd string `yaml:"motd"`
 	}
@@ -37,7 +35,7 @@ func getConf() *Config {
 	}
 	confPath := fmt.Sprintf("%sconf.yaml", configDir)
 	if _, err := os.Stat(confPath); os.IsNotExist(err) {
-		ioutil.WriteFile(confPath, []byte("server:\n    port: \"6665\"\n    name: \"daniels server\"\n    motd: \"Find out more on github.com/tehcyx/girc\""), os.ModeAppend)
+		ioutil.WriteFile(confPath, []byte("server:\n    host: \"localhost\"\n    port: \"6665\"\n    name: \"daniels server\"\n    motd: \"Find out more on github.com/tehcyx/girc\""), os.ModeAppend)
 	}
 
 	yamlFile, err := ioutil.ReadFile(confPath)
@@ -52,30 +50,5 @@ func getConf() *Config {
 }
 
 func init() {
-	conf = getConf()
-}
-
-func main() {
-	log.Println("Launching server...")
-
-	// listen on all interfaces
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", conf.Server.Port))
-	if err != nil {
-		log.Error(fmt.Errorf("listen failed, port possibly in use already: %w", err))
-	}
-
-	defer func() {
-		log.Printf("Shutting down server. Bye!\n")
-		ln.Close()
-	}()
-
-	server.InitServer()
-
-	// run loop forever (or until ctrl-c)
-	for {
-		// accept connection on port
-		conn, _ := ln.Accept()
-
-		server.InitClient(conn)
-	}
+	Values = getConf()
 }
