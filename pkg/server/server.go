@@ -110,7 +110,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 		} else if len(message) == 0 {
 			continue
 		} else {
-			log.Debug("Received message from client: %s", message)
+			log.Debugf("Received message from client: %s", message)
 			message = strings.TrimSpace(message)
 			tokens := strings.Split(message, " ")
 
