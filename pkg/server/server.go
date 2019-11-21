@@ -62,7 +62,7 @@ func (s *Server) HandleClient(conn net.Conn) {
 func (s *Server) handleClientConnect(conn net.Conn) {
 	log.Printf("Client connecting, handling connection ...\n")
 	identifier := uuid.Must(uuid.NewRandom())
-	log.Debug("This is concurrent user #%d, generated UUID is: %s\n", len(s.Clients), identifier)
+	log.Debugf("This is concurrent user #%d, generated UUID is: %s\n", len(s.Clients), identifier)
 
 	pass := false
 	initCompleted := false
