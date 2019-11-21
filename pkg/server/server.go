@@ -36,7 +36,7 @@ func New() {
 	// listen on all interfaces
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", config.Values.Server.Port))
 	if err != nil {
-		log.Error(fmt.Errorf("listen failed, port possibly in use already: %w", err))
+		log.Error(fmt.Errorf("listen failed, port possibly in use already: %v", err))
 	}
 
 	defer func() {
