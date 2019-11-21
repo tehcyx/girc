@@ -3,8 +3,8 @@ package server
 import (
 	"bufio"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"io"
-	"log"
 	"net"
 	"regexp"
 	"strconv"
@@ -192,6 +192,15 @@ func clientHandleConnect(conn net.Conn) {
 		reader := bufio.NewReader(conn)
 		// TODO https://twitter.com/davecheney/status/604837853344989184?lang=en
 		message, err := reader.ReadString('\n') // there's a problem with clients that send multiple lines, will have to figure out a solution using the scanner API
+
+		// scanner := bufio.NewScanner(conn)
+		// var message string
+		// for scanner.Scan() {
+		// 	message += scanner.Text()
+		// }
+		// if err := scanner.Err(); err != nil {
+		// 	log.Error(fmt.Errorf("reading standard input: %w", err))
+		// }
 
 		if err != nil {
 			fmt.Printf("An error occured, now closing connection to client socket. Error: %s\n", err)
