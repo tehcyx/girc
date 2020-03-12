@@ -95,9 +95,9 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 		_, err := conn.Read(make([]byte, 0))
 		if err != io.EOF {
 			// this connection is invalid
-			fmt.Printf("Client hung up unexpectedly or quit ...\n")
+			log.Printf("Client hung up unexpectedly or quit ...\n")
 		} else {
-			fmt.Printf("Client quit or inactive, closing connection ...\n")
+			log.Printf("Client quit or inactive, closing connection ...\n")
 			conn.Close()
 		}
 	}()
