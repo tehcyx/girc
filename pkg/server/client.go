@@ -23,12 +23,15 @@ type Client struct {
 	conn       net.Conn
 	clientMux  *sync.Mutex
 
+	// Registration state
+	registered bool // true after both NICK and USER are received and AddClient has run
+
 	// User mode flags
-	invisible bool // +i - invisible mode
-	wallops   bool // +w - receive wallops
-	notices   bool // +s - receive server notices
-	operator  bool // +o - IRC operator
-	away      bool   // Away status (for WHO command)
+	invisible   bool   // +i - invisible mode
+	wallops     bool   // +w - receive wallops
+	notices     bool   // +s - receive server notices
+	operator    bool   // +o - IRC operator
+	away        bool   // Away status (for WHO command)
 	awayMessage string // Away message text
 
 	// Authentication state

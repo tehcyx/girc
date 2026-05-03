@@ -419,6 +419,11 @@ func (c *Client) Health(ctx context.Context) error {
 	return c.rdb.Ping(ctx).Err()
 }
 
+// PodID returns this client's pod identifier.
+func (c *Client) PodID() string {
+	return c.podID
+}
+
 // GracefulShutdown handles graceful pod shutdown by disconnecting clients
 // without deleting their state. This allows clients to reconnect to other pods.
 // The actual cleanup of stale client data should be handled by:
@@ -644,4 +649,83 @@ func (c *Client) IsChannelRegistered(ctx context.Context, channelName string) (b
 		return false, nil // Not registered or error - treat as not registered
 	}
 	return channel.Registered, nil
+}
+
+// SetChannelTopic persists the topic for a channel.
+func (c *Client) SetChannelTopic(ctx context.Context, channelName, topic string) error {
+	channelKey := fmt.Sprintf("channel:%s", channelName)
+	dataStr, err := c.rdb.Get(ctx, channelKey).Result()
+
+	var channel ChannelData
+	if err == redis.Nil {
+		channel = ChannelData{
+			Name:    channelName,
+			Topic:   topic,
+			Members: map[string]bool{},
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to get channel: %w", err)
+	} else {
+		if err2 := json.Unmarshal([]byte(dataStr), &channel); err2 != nil {
+			return fmt.Errorf("failed to unmarshal channel: %w", err2)
+		}
+		channel.Topic = topic
+	}
+
+	data, err := json.Marshal(channel)
+	if err != nil {
+		return fmt.Errorf("failed to marshal channel: %w", err)
+	}
+	return c.rdb.Set(ctx, channelKey, data, 0).Err()
+}
+
+// SetChannelModes persists the mode string for a channel.
+func (c *Client) SetChannelModes(ctx context.Context, channelName, modes string) error {
+	channelKey := fmt.Sprintf("channel:%s", channelName)
+	dataStr, err := c.rdb.Get(ctx, channelKey).Result()
+
+	var channel ChannelData
+	if err == redis.Nil {
+		channel = ChannelData{
+			Name:    channelName,
+			Modes:   modes,
+			Members: map[string]bool{},
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to get channel: %w", err)
+	} else {
+		if err2 := json.Unmarshal([]byte(dataStr), &channel); err2 != nil {
+			return fmt.Errorf("failed to unmarshal channel: %w", err2)
+		}
+		channel.Modes = modes
+	}
+
+	data, err := json.Marshal(channel)
+	if err != nil {
+		return fmt.Errorf("failed to marshal channel: %w", err)
+	}
+	return c.rdb.Set(ctx, channelKey, data, 0).Err()
+}
+
+// HydrateChannels loads persisted channels from Redis and returns them.
+// It returns channel name -> ChannelData for channels that have at least a topic set.
+func (c *Client) HydrateChannels(ctx context.Context) ([]ChannelData, error) {
+	keys, err := c.rdb.Keys(ctx, "channel:*").Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list channel keys: %w", err)
+	}
+
+	var channels []ChannelData
+	for _, key := range keys {
+		dataStr, err := c.rdb.Get(ctx, key).Result()
+		if err != nil {
+			continue
+		}
+		var ch ChannelData
+		if err := json.Unmarshal([]byte(dataStr), &ch); err != nil {
+			continue
+		}
+		channels = append(channels, ch)
+	}
+	return channels, nil
 }
