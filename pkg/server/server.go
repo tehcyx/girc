@@ -259,7 +259,16 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 			// Collect all unique clients in the same rooms
 			notifiedClients := make(map[uuid.UUID]bool)
 
+			// Snapshot room IDs under ClientsMutex to avoid racing with KICK's
+			// delete(s.Clients[i].rooms, ...) which also holds ClientsMutex.
+			s.ClientsMutex.Lock()
+			roomIDSnapshot := make([]uuid.UUID, 0, len(client.rooms))
 			for roomID := range client.rooms {
+				roomIDSnapshot = append(roomIDSnapshot, roomID)
+			}
+			s.ClientsMutex.Unlock()
+
+			for _, roomID := range roomIDSnapshot {
 				s.RoomsMutex.Lock()
 				var room *Room
 				for i := range s.Rooms {
@@ -446,53 +455,87 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 		roomName = roomName[1:]
 	}
 
-	// Find the actual client in the server's Clients slice (not the parameter copy)
-	var clientPtr *Client
+	// Copy the fields we need from the client entry while holding ClientsMutex.
+	// We must not retain a raw *Client across the lock boundary because a
+	// concurrent AddClient/RemoveClient can append to s.Clients and reallocate
+	// its backing array, making any previously captured *Client stale.
+	var (
+		clientID    uuid.UUID
+		clientNick  string
+		clientUser  string
+		clientConn  net.Conn
+		clientMux   *sync.Mutex
+		clientRooms map[uuid.UUID]bool
+	)
 	s.ClientsMutex.Lock()
 	log.Infof("JoinRoomByName: Looking for client %s (UUID: %s) in %d clients", client.nick, client.identifier, len(s.Clients))
+	found := false
 	for i := range s.Clients {
 		if s.Clients[i].identifier == client.identifier {
-			clientPtr = &s.Clients[i]
+			clientID = s.Clients[i].identifier
+			clientNick = s.Clients[i].nick
+			clientUser = s.Clients[i].user
+			clientConn = s.Clients[i].conn
+			clientMux = s.Clients[i].clientMux
+			clientRooms = s.Clients[i].rooms
+			found = true
 			log.Infof("JoinRoomByName: Found client %s at index %d", client.nick, i)
 			break
 		}
 	}
 	s.ClientsMutex.Unlock()
 
-	if clientPtr == nil {
+	if !found {
 		log.Errorf("JoinRoomByName: Client %s (UUID: %s) not found in server", client.nick, client.identifier)
 		return fmt.Errorf("Client not found in server")
 	}
 
-	var roomPtr *Room
+	// Similarly, copy what we need from the room under RoomsMutex.
+	// An append to s.Rooms can reallocate its backing array, so we must not
+	// retain a raw *Room across the lock boundary.
+	var (
+		roomID       uuid.UUID
+		roomName2    string
+		roomTopic    string
+		roomMux      *sync.Mutex
+		roomClients  map[uuid.UUID]bool
+		roomOperators map[uuid.UUID]bool
+	)
+	isNewRoom := false
 	s.RoomsMutex.Lock()
+	roomIdx := -1
 	for i := range s.Rooms {
 		if strings.Compare(s.Rooms[i].name, roomName) == 0 {
-			roomPtr = &s.Rooms[i]
+			roomIdx = i
 			break
 		}
 	}
-	isNewRoom := false
-	if roomPtr == nil {
+	if roomIdx == -1 {
 		newRoom := s.createRoom(roomName)
 		s.Rooms = append(s.Rooms, newRoom)
-		roomPtr = &s.Rooms[len(s.Rooms)-1]
+		roomIdx = len(s.Rooms) - 1
 		isNewRoom = true
 	}
+	roomID = s.Rooms[roomIdx].identifier
+	roomName2 = s.Rooms[roomIdx].name
+	roomTopic = s.Rooms[roomIdx].topic
+	roomMux = s.Rooms[roomIdx].roomMux
+	roomClients = s.Rooms[roomIdx].clients
+	roomOperators = s.Rooms[roomIdx].operators
 	s.RoomsMutex.Unlock()
 
-	roomPtr.roomMux.Lock()
-	roomPtr.clients[clientPtr.identifier] = true
+	roomMux.Lock()
+	roomClients[clientID] = true
 	// If this is a new room, make the first user an operator
 	if isNewRoom {
-		roomPtr.operators[clientPtr.identifier] = true
-		log.Infof("JoinRoomByName: Made %s an operator of new room #%s", clientPtr.nick, roomName)
+		roomOperators[clientID] = true
+		log.Infof("JoinRoomByName: Made %s an operator of new room #%s", clientNick, roomName)
 	}
-	roomPtr.roomMux.Unlock()
+	roomMux.Unlock()
 
-	clientPtr.clientMux.Lock()
-	clientPtr.rooms[roomPtr.identifier] = true
-	clientPtr.clientMux.Unlock()
+	clientMux.Lock()
+	clientRooms[roomID] = true
+	clientMux.Unlock()
 
 	// Update Redis if enabled
 	if s.RedisClient != nil {
@@ -500,22 +543,22 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 		channelName := "#" + roomName
 
 		// Join channel in Redis
-		if err := s.RedisClient.JoinChannel(ctx, clientPtr.identifier.String(), channelName); err != nil {
+		if err := s.RedisClient.JoinChannel(ctx, clientID.String(), channelName); err != nil {
 			log.Errorf("Failed to join channel in Redis: %v", err)
 			// Continue anyway - channel is joined locally
 		} else {
 			if s.getConfig().Server.Debug {
-		log.Debugf("Client %s joined channel %s in Redis", clientPtr.nick, channelName)
-	}
+				log.Debugf("Client %s joined channel %s in Redis", clientNick, channelName)
+			}
 		}
 
 		// Publish JOIN event to other pods
 		event := redis.Event{
 			Type: "JOIN",
 			Data: map[string]interface{}{
-				"uuid":    clientPtr.identifier.String(),
-				"nick":    clientPtr.nick,
-				"user":    clientPtr.user,
+				"uuid":    clientID.String(),
+				"nick":    clientNick,
+				"user":    clientUser,
 				"channel": channelName,
 				"pod_id":  s.RedisClient.PodID(),
 			},
@@ -528,19 +571,19 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 
 	// send to all existing clients + user, that user has joined:
 	// Take snapshot of room clients while holding lock
-	roomPtr.roomMux.Lock()
-	clientIDs := make([]uuid.UUID, 0, len(roomPtr.clients))
-	for ident := range roomPtr.clients {
+	roomMux.Lock()
+	clientIDs := make([]uuid.UUID, 0, len(roomClients))
+	for ident := range roomClients {
 		clientIDs = append(clientIDs, ident)
 	}
-	roomPtr.roomMux.Unlock()
+	roomMux.Unlock()
 
 	var names []string
 	s.ClientsMutex.Lock()
 	for _, ident := range clientIDs {
 		for i := range s.Clients {
 			if ident == s.Clients[i].identifier {
-				send(s.Clients[i].conn, ":%s!%s@%s %s #%s\n", clientPtr.nick, clientPtr.user, s.getConfig().Server.Host, JoinCmd, roomPtr.name)
+				send(s.Clients[i].conn, ":%s!%s@%s %s #%s\n", clientNick, clientUser, s.getConfig().Server.Host, JoinCmd, roomName2)
 				names = append(names, s.Clients[i].nick)
 				break
 			}
@@ -548,19 +591,19 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 	}
 	s.ClientsMutex.Unlock()
 
-	if roomPtr.topic == "" {
+	if roomTopic == "" {
 		// 331 RPL_NOTOPIC
-		send(clientPtr.conn, ":%s %s %s #%s :No topic is set\n", s.getConfig().Server.Host, RplNoTopic, clientPtr.nick, roomPtr.name)
+		send(clientConn, ":%s %s %s #%s :No topic is set\n", s.getConfig().Server.Host, RplNoTopic, clientNick, roomName2)
 	} else {
 		// 332 RPL_TOPIC
-		send(clientPtr.conn, ":%s %s %s #%s :%s\n", s.getConfig().Server.Host, RplTopic, clientPtr.nick, roomPtr.name, roomPtr.topic)
+		send(clientConn, ":%s %s %s #%s :%s\n", s.getConfig().Server.Host, RplTopic, clientNick, roomName2, roomTopic)
 	}
 
 	// send list of all clients in room to user
 	// "( "=" / "*" / "@" ) <channel> :[ "@" / "+" ] <nick> *( " " [ "@" / "+" ] <nick> )
-	send(clientPtr.conn, ":%s %s %s = #%s :%s\n", s.getConfig().Server.Host, RplNameReply, clientPtr.nick, roomPtr.name, strings.Join(names[:], " "))
+	send(clientConn, ":%s %s %s = #%s :%s\n", s.getConfig().Server.Host, RplNameReply, clientNick, roomName2, strings.Join(names[:], " "))
 
-	send(clientPtr.conn, ":%s %s %s #%s :End of NAMES list\n", s.getConfig().Server.Host, RplEndOfNames, clientPtr.nick, roomPtr.name)
+	send(clientConn, ":%s %s %s #%s :End of NAMES list\n", s.getConfig().Server.Host, RplEndOfNames, clientNick, roomName2)
 	return nil
 }
 
@@ -1179,6 +1222,7 @@ func (s *Server) handleRedisPart(event *redis.Event) {
 // Per RFC, QUIT should go only to clients sharing a channel with the quitter.
 // Cross-pod events do not carry the remote client's channel list, so we send
 // to all local registered clients as an approximation.
+// TODO(follow-up): narrow QUIT broadcast to channel-sharing clients (requires event payload extension)
 func (s *Server) handleRedisQuit(event *redis.Event) {
 	originPod := redisStr(event.Data, "pod_id")
 	if originPod == s.RedisClient.PodID() {
