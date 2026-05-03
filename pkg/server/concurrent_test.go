@@ -145,6 +145,70 @@ func TestConcurrentPrivmsg(t *testing.T) {
 	// No assertions beyond no panic / no data race detected by -race.
 }
 
+// TestConcurrentJoinDistinctChannels stress-tests the roomPtr fix in
+// JoinRoomByName: when N goroutines each create a brand-new channel, every
+// append to s.Rooms can reallocate the backing array, making any raw *Room
+// captured before the append stale.  Run with -race.
+func TestConcurrentJoinDistinctChannels(t *testing.T) {
+	addr := startTestServer(t)
+
+	const n = 16
+	conns := make([]*ircConn, n)
+	for i := 0; i < n; i++ {
+		c, errStr := registerNoFatal(addr, fmt.Sprintf("distjoin%d", i))
+		if errStr != "" {
+			t.Fatalf("distjoin%d register: %s", i, errStr)
+		}
+		t.Cleanup(func() { c.conn.Close() })
+		conns[i] = c
+	}
+
+	// Each goroutine joins its own unique channel, forcing s.Rooms to grow
+	// on every JOIN and potentially reallocating the slice backing array.
+	var wg sync.WaitGroup
+	errCh := make(chan string, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int, c *ircConn) {
+			defer wg.Done()
+			chanName := fmt.Sprintf("#distinct%d", idx)
+			fmt.Fprintf(c.conn, "JOIN %s\r\n", chanName)
+
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				c.conn.SetReadDeadline(deadline)
+				line, err := c.reader.ReadString('\n')
+				if err != nil {
+					errCh <- fmt.Sprintf("distjoin%d read error: %v", idx, err)
+					return
+				}
+				if strings.Contains(line, "JOIN") && strings.Contains(line, fmt.Sprintf("distinct%d", idx)) {
+					return
+				}
+				if strings.Contains(line, "366") {
+					return
+				}
+			}
+			errCh <- fmt.Sprintf("distjoin%d: timed out waiting for JOIN #distinct%d", idx, idx)
+		}(i, conns[i])
+	}
+
+	wg.Wait()
+
+	for _, c := range conns {
+		if c != nil {
+			c.conn.Close()
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	close(errCh)
+	for msg := range errCh {
+		t.Error(msg)
+	}
+}
+
 // TestConcurrentKickNotPanic stress-tests the KICK path by having the channel
 // operator kick multiple victims concurrently. Run with -race.
 // Only the KICK sends themselves are concurrent; setup is sequential.
@@ -177,4 +241,79 @@ func TestConcurrentKickNotPanic(t *testing.T) {
 	}
 	wg.Wait()
 	// Success if no race and no panic.
+}
+
+// TestConcurrentNoticeRace is a regression test for the NOTICE snapshot fix
+// (A5 in iter 3): the NOTICE channel handler previously iterated s.Clients
+// under roomMux only, racing with concurrent AddClient/RemoveClient which
+// requires ClientsMutex.  This test sends NOTICE messages while clients are
+// simultaneously connecting and disconnecting.  Run with -race.
+func TestConcurrentNoticeRace(t *testing.T) {
+	addr := startTestServer(t)
+
+	// Establish a stable sender and a set of stable channel members.
+	const stable = 4
+	sender := dialServer(t, addr)
+	register(t, sender, "noticesender")
+	sender.send(t, "JOIN #noticerace")
+	sender.readUntil(t, func(l string) bool {
+		return strings.Contains(l, "JOIN") && strings.Contains(l, "noticerace")
+	})
+
+	stableConns := make([]*ircConn, stable)
+	for i := 0; i < stable; i++ {
+		c := dialServer(t, addr)
+		register(t, c, fmt.Sprintf("noticemember%d", i))
+		c.send(t, "JOIN #noticerace")
+		c.readUntil(t, func(l string) bool {
+			return strings.Contains(l, "JOIN") && strings.Contains(l, "noticerace")
+		})
+		stableConns[i] = c
+	}
+
+	// Goroutine A: send NOTICE to the channel rapidly.
+	var senderWg sync.WaitGroup
+	senderWg.Add(1)
+	go func() {
+		defer senderWg.Done()
+		for i := 0; i < 40; i++ {
+			sender.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			fmt.Fprintf(sender.conn, "NOTICE #noticerace :stress %d\r\n", i)
+		}
+	}()
+
+	// Goroutine B: repeatedly connect, register, join and immediately disconnect
+	// — this drives AddClient/RemoveClient concurrently with the NOTICE sends.
+	var connWg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		connWg.Add(1)
+		go func(idx int) {
+			defer connWg.Done()
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				return
+			}
+			r := bufio.NewReader(conn)
+			nick := fmt.Sprintf("transient%d", idx)
+			fmt.Fprintf(conn, "NICK %s\r\nUSER %s 0 * :T\r\n", nick, nick)
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				conn.SetReadDeadline(deadline)
+				line, err := r.ReadString('\n')
+				if err != nil {
+					break
+				}
+				if strings.Contains(line, " 001 ") {
+					fmt.Fprintf(conn, "JOIN #noticerace\r\n")
+					break
+				}
+			}
+			// Disconnect immediately — triggers RemoveClient concurrently.
+			conn.Close()
+		}(i)
+	}
+
+	senderWg.Wait()
+	connWg.Wait()
+	// Success criterion: -race detector reports no data races.
 }

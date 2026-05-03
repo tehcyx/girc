@@ -76,6 +76,10 @@ func TestMODEBroadcastUsesConfigHost(t *testing.T) {
 	if !strings.Contains(modeLine, customHost) {
 		t.Errorf("MODE broadcast prefix should contain %q, got: %s", customHost, modeLine)
 	}
+	// A1 regression: the channel name in a MODE broadcast must carry the '#' prefix.
+	if !strings.Contains(modeLine, "#hosttest") {
+		t.Errorf("MODE broadcast must contain '#hosttest' (with # prefix), got: %s", modeLine)
+	}
 }
 
 // TestDefaultChannelModesAppliedOnJoin is an integration test: it boots a
