@@ -41,16 +41,7 @@ func registerNoFatal(addr, nick string) (*ircConn, string) {
 // TestConcurrentJoinSameChannel stress-tests JoinRoomByName by registering
 // clients sequentially and then having them all JOIN the same channel
 // concurrently. Run with -race.
-//
-// BLOCKED: the -race detector flags the clientPtr-invalidation race in
-// JoinRoomByName (server.go): s.Clients pointer stored before ClientsMutex
-// released, then used after; concurrent RemoveClient reallocs s.Clients.
-// Fix required in production code (server.go JoinRoomByName) before this test
-// can run green under -race.
 func TestConcurrentJoinSameChannel(t *testing.T) {
-	t.Skip("BLOCKED: production race in JoinRoomByName clientPtr invalidation " +
-		"(server.go): clientPtr stored before ClientsMutex released; concurrent " +
-		"RemoveClient reallocs s.Clients; fix required in production code")
 	addr := startTestServer(t)
 
 	// n=8: enough to exercise concurrency without leaving so many lingering
@@ -122,17 +113,7 @@ func TestConcurrentJoinSameChannel(t *testing.T) {
 // TestConcurrentPrivmsg stress-tests PRIVMSG by having multiple senders
 // simultaneously send to the same channel. Run with -race.
 // Registrations and JOINs are sequential; only the actual sends are concurrent.
-//
-// BLOCKED: intermittently fails under -race due to the JoinRoomByName
-// clientPtr-invalidation race (server.go): clientPtr is obtained from s.Clients
-// before releasing ClientsMutex, then used after — if RemoveClient runs
-// concurrently and reallocates s.Clients via append, the raw pointer is stale.
-// This is a pre-existing production race; fix required in server.go before
-// this test can run reliably under -race.
 func TestConcurrentPrivmsg(t *testing.T) {
-	t.Skip("BLOCKED: production race in JoinRoomByName clientPtr invalidation " +
-		"(server.go): clientPtr stored before ClientsMutex released, used after; " +
-		"concurrent RemoveClient may realloc s.Clients; fix required in production code")
 	addr := startTestServer(t)
 
 	const senders = 10
@@ -167,16 +148,7 @@ func TestConcurrentPrivmsg(t *testing.T) {
 // TestConcurrentKickNotPanic stress-tests the KICK path by having the channel
 // operator kick multiple victims concurrently. Run with -race.
 // Only the KICK sends themselves are concurrent; setup is sequential.
-//
-// BLOCKED: production race detected. The KICK handler (handlers.go) writes to
-// s.Clients[i].rooms while holding s.ClientsMutex, but handleClientConnect's
-// defer closure (server.go:262) reads client.rooms (a local copy of Client)
-// without any lock. These two goroutines race on the rooms map.
-// Fix needed in production code before this test can run green under -race.
 func TestConcurrentKickNotPanic(t *testing.T) {
-	t.Skip("BLOCKED: production race in KICK handler / handleClientConnect defer — " +
-		"handlers.go delete(s.Clients[i].rooms) races with server.go defer range client.rooms; " +
-		"fix required in production code")
 	addr := startTestServer(t)
 
 	const targets = 5
