@@ -1085,7 +1085,7 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 				} else {
 					// Send to channel
 					if inChannel, room := s.IsUserInRoom(*client, target); inChannel {
-						// A5: Snapshot member IDs under roomMux, then send under ClientsMutex.
+						// Snapshot member IDs under roomMux, then send under ClientsMutex.
 						// Iterating s.Clients without ClientsMutex races with AddClient/RemoveClient.
 						room.roomMux.Lock()
 						memberIDs := make([]uuid.UUID, 0, len(room.clients))
@@ -1872,7 +1872,7 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 					modeStr.WriteString("p")
 				}
 
-				// A1: IRC clients expect the channel name with # prefix in MODE reply.
+				// IRC clients expect the channel name with # prefix in MODE reply.
 				send(conn, ":%s %s %s #%s %s\n",
 					s.getConfig().Server.Host, RplChannelModeIs, client.nick, room.name, modeStr.String())
 				log.Infof("[MODE] %s queried modes for %s: %s", client.nick, room.name, modeStr.String())
@@ -2002,7 +2002,7 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 				}
 
 				// Capture fields we need after unlock while still holding RoomsMutex.
-				// A3: roomModeString reads room flags — call it here, under the lock.
+				// roomModeString reads room flags — call it here, under the lock.
 				bcastRoomName := room.name
 				bcastRoomClients := room.clients
 				fullModeStr := roomModeString(room)
@@ -2019,7 +2019,7 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 					s.ClientsMutex.Lock()
 					for i := range s.Clients {
 						if bcastRoomClients[s.Clients[i].identifier] {
-							// A1: IRC clients expect the channel name with # prefix in MODE.
+							// IRC clients expect the channel name with # prefix in MODE.
 							send(s.Clients[i].conn, ":%s!%s@%s MODE #%s %s%s\n",
 								client.nick, client.user, s.getConfig().Server.Host, bcastRoomName, modeChange, modeArgsStr)
 						}

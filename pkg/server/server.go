@@ -494,11 +494,10 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 	// An append to s.Rooms can reallocate its backing array, so we must not
 	// retain a raw *Room across the lock boundary.
 	var (
-		roomID       uuid.UUID
-		roomName2    string
-		roomTopic    string
-		roomMux      *sync.Mutex
-		roomClients  map[uuid.UUID]bool
+		roomID        uuid.UUID
+		roomTopic     string
+		roomMux       *sync.Mutex
+		roomClients   map[uuid.UUID]bool
 		roomOperators map[uuid.UUID]bool
 	)
 	isNewRoom := false
@@ -517,7 +516,6 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 		isNewRoom = true
 	}
 	roomID = s.Rooms[roomIdx].identifier
-	roomName2 = s.Rooms[roomIdx].name
 	roomTopic = s.Rooms[roomIdx].topic
 	roomMux = s.Rooms[roomIdx].roomMux
 	roomClients = s.Rooms[roomIdx].clients
@@ -583,7 +581,7 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 	for _, ident := range clientIDs {
 		for i := range s.Clients {
 			if ident == s.Clients[i].identifier {
-				send(s.Clients[i].conn, ":%s!%s@%s %s #%s\n", clientNick, clientUser, s.getConfig().Server.Host, JoinCmd, roomName2)
+				send(s.Clients[i].conn, ":%s!%s@%s %s #%s\n", clientNick, clientUser, s.getConfig().Server.Host, JoinCmd, roomName)
 				names = append(names, s.Clients[i].nick)
 				break
 			}
@@ -593,17 +591,17 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 
 	if roomTopic == "" {
 		// 331 RPL_NOTOPIC
-		send(clientConn, ":%s %s %s #%s :No topic is set\n", s.getConfig().Server.Host, RplNoTopic, clientNick, roomName2)
+		send(clientConn, ":%s %s %s #%s :No topic is set\n", s.getConfig().Server.Host, RplNoTopic, clientNick, roomName)
 	} else {
 		// 332 RPL_TOPIC
-		send(clientConn, ":%s %s %s #%s :%s\n", s.getConfig().Server.Host, RplTopic, clientNick, roomName2, roomTopic)
+		send(clientConn, ":%s %s %s #%s :%s\n", s.getConfig().Server.Host, RplTopic, clientNick, roomName, roomTopic)
 	}
 
 	// send list of all clients in room to user
 	// "( "=" / "*" / "@" ) <channel> :[ "@" / "+" ] <nick> *( " " [ "@" / "+" ] <nick> )
-	send(clientConn, ":%s %s %s = #%s :%s\n", s.getConfig().Server.Host, RplNameReply, clientNick, roomName2, strings.Join(names[:], " "))
+	send(clientConn, ":%s %s %s = #%s :%s\n", s.getConfig().Server.Host, RplNameReply, clientNick, roomName, strings.Join(names[:], " "))
 
-	send(clientConn, ":%s %s %s #%s :End of NAMES list\n", s.getConfig().Server.Host, RplEndOfNames, clientNick, roomName2)
+	send(clientConn, ":%s %s %s #%s :End of NAMES list\n", s.getConfig().Server.Host, RplEndOfNames, clientNick, roomName)
 	return nil
 }
 
