@@ -148,18 +148,15 @@ func TestSETPASSNotAuthenticated(t *testing.T) {
 // TestREGISTERThenAuthenticate verifies the full registration + login flow:
 // REGISTER creates an account; PASS+NICK+USER authenticates on the next connection.
 func TestREGISTERThenAuthenticate(t *testing.T) {
-	addr, mr := startAccountServer(t)
-	_ = mr
+	addr, _ := startAccountServer(t)
 
 	// Connection 1: register the account.
-	c1 := &ircConn{reader: bufio.NewReader(nil)}
 	conn1, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer conn1.Close()
-	c1.conn = conn1
-	c1.reader = bufio.NewReader(conn1)
+	c1 := &ircConn{conn: conn1, reader: bufio.NewReader(conn1)}
 	c1.send(t, "REGISTER authuser Password123! auth@example.com")
 	c1.readUntil(t, func(l string) bool { return strings.Contains(l, "902") || strings.Contains(l, "Account created") })
 
