@@ -122,6 +122,15 @@ func New() {
 
 	srv.initRooms()
 
+	// Hydrate channels from Redis if enabled.
+	if srv.RedisClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := srv.hydrateChannelsFromRedis(ctx); err != nil {
+			log.Errorf("Failed to hydrate channels from Redis: %v", err)
+		}
+		cancel()
+	}
+
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -1248,6 +1257,13 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					room.roomMux.Lock()
 					room.topic = newTopic
 					room.roomMux.Unlock()
+
+					// Persist topic to Redis.
+					if s.RedisClient != nil {
+						if err := s.RedisClient.SetChannelTopic(context.Background(), "#"+strings.TrimPrefix(channelName, "#"), newTopic); err != nil {
+							log.Errorf("[TOPIC] Failed to persist topic to Redis: %v", err)
+						}
+					}
 
 					// Notify all users in the channel about the topic change
 					// Format: :nick!user@host TOPIC #channel :new topic
@@ -2895,6 +2911,56 @@ func send(conn net.Conn, format string, a ...interface{}) {
 // 	// }
 // 	return ""
 // }
+
+// hydrateChannelsFromRedis loads persisted channel state (topic, modes) from Redis
+// and creates the corresponding rooms on this server.
+func (s *Server) hydrateChannelsFromRedis(ctx context.Context) error {
+	if s.RedisClient == nil {
+		return nil
+	}
+	channels, err := s.RedisClient.HydrateChannels(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, ch := range channels {
+		channelName := ch.Name
+		if strings.HasPrefix(channelName, "#") {
+			channelName = channelName[1:]
+		}
+		if channelName == "lobby" {
+			continue // lobby is always created by initRooms
+		}
+
+		s.RoomsMutex.Lock()
+		exists := false
+		for i := range s.Rooms {
+			if s.Rooms[i].name == channelName {
+				// Update topic if persisted.
+				if ch.Topic != "" {
+					s.Rooms[i].roomMux.Lock()
+					s.Rooms[i].topic = ch.Topic
+					s.Rooms[i].roomMux.Unlock()
+				}
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			room := createRoom(channelName)
+			if ch.Topic != "" {
+				room.topic = ch.Topic
+			}
+			if ch.Registered {
+				room.registered = true
+			}
+			s.Rooms = append(s.Rooms, room)
+			log.Infof("[hydrate] Restored channel #%s from Redis (topic: %q)", channelName, ch.Topic)
+		}
+		s.RoomsMutex.Unlock()
+	}
+	return nil
+}
 
 // pingClient sends a PING to the given connection every PingInterval.
 // It closes the connection if no PONG is received within 2*PingInterval.
