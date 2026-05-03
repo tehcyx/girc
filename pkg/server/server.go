@@ -33,6 +33,14 @@ type Server struct {
 
 	ClientTimeout time.Duration
 
+	// PingInterval controls how often the server pings each client.
+	// 0 means no pings (useful in tests).
+	PingInterval time.Duration
+
+	// cfg holds the server's active configuration. If nil, falls back to
+	// the global config.Values.
+	cfg *config.Config
+
 	// Redis client for distributed state management (nil if disabled)
 	RedisClient *redis.Client
 
@@ -45,8 +53,10 @@ type Server struct {
 func New() {
 	log.Println("Launching server...")
 
+	cfg := config.Values
+
 	// listen on all interfaces
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", config.Values.Server.Port))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.Server.Port))
 	if err != nil {
 		log.Error(fmt.Errorf("listen failed, port possibly in use already: %v", err))
 	}
@@ -66,20 +76,22 @@ func New() {
 		RoomsMutex: &sync.Mutex{},
 
 		ClientTimeout: 15 * time.Minute,
+		PingInterval:  90 * time.Second,
+		cfg:           cfg,
 	}
 
 	// Initialize Redis client if enabled
-	if config.Values.Redis.Enabled {
+	if cfg.Redis.Enabled {
 		log.Println("Redis enabled, initializing distributed state management...")
 
 		// Generate pod ID if not provided
-		podID := config.Values.Redis.PodID
+		podID := cfg.Redis.PodID
 		if podID == "" {
 			podID = uuid.Must(uuid.NewRandom()).String()
 			log.Printf("Generated pod ID: %s", podID)
 		}
 
-		redisClient, err := redis.NewClient(config.Values.Redis.URL, podID)
+		redisClient, err := redis.NewClient(cfg.Redis.URL, podID)
 		if err != nil {
 			log.Errorf("Failed to initialize Redis client: %v", err)
 			log.Println("Continuing in non-distributed mode...")
@@ -176,6 +188,15 @@ func New() {
 	log.Println("Graceful shutdown complete")
 }
 
+// getConfig returns the server's active configuration, falling back to the
+// package-level global when the server has no local config set.
+func (s *Server) getConfig() *config.Config {
+	if s.cfg != nil {
+		return s.cfg
+	}
+	return config.Values
+}
+
 func (s *Server) initRooms() {
 	lobby := createRoom("lobby")
 
@@ -189,12 +210,9 @@ func (s *Server) initRooms() {
 func (s *Server) handleClientConnect(conn net.Conn) {
 	log.Printf("Client connecting, handling connection ...\n")
 	identifier := uuid.Must(uuid.NewRandom())
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("This is concurrent user #%d, generated UUID is: %s\n", len(s.Clients), identifier)
 	}
-
-	pass := true // Allow PASS command before registration
-	initCompleted := false
 
 	client := Client{}
 	client.clientMux = &sync.Mutex{}
@@ -221,7 +239,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 		if client.nick != "" {
 			errorMsg := fmt.Sprintf("ERROR :Closing Link: %s (%s)\r\n", client.nick, disconnectReason)
 			conn.Write([]byte(errorMsg))
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 		log.Debugf("Sent ERROR to %s: %s", client.nick, disconnectReason)
 	}
 		}
@@ -230,7 +248,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 		// This lets other users know this client has left
 		if client.nick != "" {
 			quitMsg := fmt.Sprintf(":%s!%s@%s QUIT :%s\r\n",
-				client.nick, client.user, config.Values.Server.Host, disconnectReason)
+				client.nick, client.user, s.getConfig().Server.Host, disconnectReason)
 
 			// Collect all unique clients in the same rooms
 			notifiedClients := make(map[uuid.UUID]bool)
@@ -271,7 +289,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 			}
 
 			if len(notifiedClients) > 0 {
-				if config.Values.Server.Debug {
+				if s.getConfig().Server.Debug {
 		log.Debugf("Sent QUIT notification for %s to %d users", client.nick, len(notifiedClients))
 	}
 			}
@@ -310,7 +328,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 			log.Infof("Received empty message, continuing...")
 			continue
 		} else {
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 				log.Infof("Received message from client: %s", message)
 			}
 			message = strings.TrimSpace(message)
@@ -320,7 +338,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 			args := strings.Join(tokens[1:], " ")
 
 			// Log command parsing, but sanitize sensitive commands (PASS, REGISTER, SETPASS)
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 				if cmd == PassCmd || cmd == RegisterCmd || cmd == SetPassCmd {
 					log.Infof("Parsed command: '%s', args: [REDACTED]", cmd)
 				} else {
@@ -338,19 +356,17 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 			} else if cmd == QuitCmd {
 				// send goodbye message
 				return
-			} else if cmd == PassCmd && pass {
+			} else if cmd == PassCmd && !client.registered {
 				// Command: PASS Parameters: <password>
 				// Store password for authentication during NICK/USER registration
 				log.Infof("Processing PASS command")
 				if len(args) == 0 {
 					log.Infof("PASS: No password given")
-					send(conn, ":%s %s PASS :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams)
-					pass = false
+					send(conn, ":%s %s PASS :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams)
 					continue
 				}
 				client.password = args
 				log.Infof("PASS: Password stored for authentication")
-				pass = false
 				continue
 			} else if cmd == RegisterCmd {
 				// Command: REGISTER Parameters: <username> <password> <email>
@@ -361,7 +377,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if len(parts) < 3 {
 					log.Infof("REGISTER: Not enough parameters")
 					send(conn, ":%s %s %s :Not enough parameters (usage: REGISTER <username> <password> <email>)\n",
-						config.Values.Server.Host, ErrNeedMoreParams, RegisterCmd)
+						s.getConfig().Server.Host, ErrNeedMoreParams, RegisterCmd)
 					continue
 				}
 
@@ -375,7 +391,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if !validNickCharset(username) {
 					log.Infof("REGISTER: Invalid username charset: %s", username)
 					send(conn, ":%s %s :Invalid username (must contain only letters, numbers, -, _, [, ], \\, `, ^, {, })\n",
-						config.Values.Server.Host, ErrNickInvalid)
+						s.getConfig().Server.Host, ErrNickInvalid)
 					continue
 				}
 
@@ -383,7 +399,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if !IsValidPassword(password) {
 					log.Infof("REGISTER: Weak password for user '%s'", username)
 					send(conn, ":%s %s :Password does not meet security requirements (minimum 8 characters, maximum 72 characters)\n",
-						config.Values.Server.Host, ErrWeakPassword)
+						s.getConfig().Server.Host, ErrWeakPassword)
 					continue
 				}
 
@@ -391,7 +407,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if !IsValidEmail(email) {
 					log.Infof("REGISTER: Invalid email for user '%s': %s", username, email)
 					send(conn, ":%s %s :Invalid email address\n",
-						config.Values.Server.Host, ErrInvalidEmail)
+						s.getConfig().Server.Host, ErrInvalidEmail)
 					continue
 				}
 
@@ -404,7 +420,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						// User account already exists
 						log.Infof("REGISTER: Username '%s' already registered", username)
 						send(conn, ":%s %s :Username already registered\n",
-							config.Values.Server.Host, ErrRegisteredAlready)
+							s.getConfig().Server.Host, ErrRegisteredAlready)
 						continue
 					}
 					// Error could mean user not found (expected) or Redis error
@@ -412,7 +428,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				} else {
 					log.Warn("REGISTER: Redis not available, cannot persist user registration")
 					send(conn, ":%s %s :Registration service not available\n",
-						config.Values.Server.Host, ErrNoSuchService)
+						s.getConfig().Server.Host, ErrNoSuchService)
 					continue
 				}
 
@@ -421,7 +437,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if err != nil {
 					log.Errorf("REGISTER: Failed to hash password for user '%s': %v", username, err)
 					send(conn, ":%s %s :Registration failed - please try again later\n",
-						config.Values.Server.Host, ErrNoSuchService)
+						s.getConfig().Server.Host, ErrNoSuchService)
 					continue
 				}
 
@@ -431,73 +447,151 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if err != nil {
 					log.Errorf("REGISTER: Failed to store user '%s': %v", username, err)
 					send(conn, ":%s %s :Registration failed - please try again later\n",
-						config.Values.Server.Host, ErrNoSuchService)
+						s.getConfig().Server.Host, ErrNoSuchService)
 					continue
 				}
 
 				log.Infof("REGISTER: Successfully registered user '%s'", username)
 				send(conn, ":%s %s %s %s :Account created successfully. To login: send PASS <password>, then NICK %s, then USER %s 0 * :Your Name\n",
-					config.Values.Server.Host, RplRegistered, username, username, username, username)
+					s.getConfig().Server.Host, RplRegistered, username, username, username, username)
 				continue
-			} else if cmd == NickCmd && !pass {
+			} else if cmd == NickCmd {
 				// Command: NICK Parameters: <nickname> [ <hopcount> ]
+				// Allowed both before and after registration.
 				log.Infof("Processing NICK command with args: '%s'", args)
-				if len(args) == 0 {
+				newNick := strings.TrimSpace(args)
+				if len(newNick) == 0 {
 					log.Infof("NICK: No nickname given")
-					send(conn, ":%s %s :No nickname given\n", config.Values.Server.Host, ErrNickNull)
+					send(conn, ":%s %s :No nickname given\n", s.getConfig().Server.Host, ErrNickNull)
 					continue
 				}
-				if !validNickCharset(args) {
-					log.Infof("NICK: Invalid nickname charset: %s", args)
-					send(conn, ":%s %s * %s :Erroneous nickname\n", config.Values.Server.Host, ErrNickInvalid, args)
+				if !validNickCharset(newNick) {
+					log.Infof("NICK: Invalid nickname charset: %s", newNick)
+					send(conn, ":%s %s * %s :Erroneous nickname\n", s.getConfig().Server.Host, ErrNickInvalid, newNick)
 					continue
 				}
-				// Check nick availability - local and Redis if enabled
-				localExists := s.ClientExists(args)
-				redisExists := false
+				// Check nick availability - skip self if already registered.
+				localExists := false
+				if newNick != client.nick {
+					s.ClientsMutex.Lock()
+					for _, c := range s.Clients {
+						if strings.EqualFold(c.nick, newNick) && c.identifier != client.identifier {
+							localExists = true
+							break
+						}
+					}
+					s.ClientsMutex.Unlock()
+				}
 
-				if s.RedisClient != nil {
+				redisExists := false
+				if s.RedisClient != nil && newNick != client.nick {
 					ctx := context.Background()
-					available, err := s.RedisClient.IsNickAvailable(ctx, args)
+					available, err := s.RedisClient.IsNickAvailable(ctx, newNick)
 					if err != nil {
 						log.Errorf("Failed to check nick availability in Redis: %v", err)
-						// Continue with local check only
 					} else {
 						redisExists = !available
 					}
 				}
 
 				if localExists || redisExists {
-					log.Infof("NICK: Nickname '%s' already in use", args)
-					send(conn, ":%s %s * %s :Nickname is already in use\n", config.Values.Server.Host, ErrNickInUse, args)
-				} else {
-					log.Infof("NICK: Setting nickname to '%s'", args)
-					client.nick = args
-					client.user = "*"
+					log.Infof("NICK: Nickname '%s' already in use", newNick)
+					send(conn, ":%s %s * %s :Nickname is already in use\n", s.getConfig().Server.Host, ErrNickInUse, newNick)
 					continue
 				}
-			} else if cmd == UserCmd && !pass {
+
+				if client.registered {
+					// Nick change after registration — broadcast to user + all shared channels.
+					oldNick := client.nick
+					client.nick = newNick
+					s.UpdateClientNick(client.identifier, newNick)
+
+					if s.RedisClient != nil {
+						ctx := context.Background()
+						_ = s.RedisClient.UpdateClientNick(ctx, client.identifier.String(), oldNick, newNick)
+						event := redis.Event{
+							Type: "NICK",
+							Data: map[string]interface{}{
+								"uuid":     client.identifier.String(),
+								"old_nick": oldNick,
+								"new_nick": newNick,
+							},
+						}
+						if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
+							log.Errorf("Failed to publish NICK event: %v", err)
+						}
+					}
+
+					// Notify: self + all clients in shared channels (deduped).
+					nickMsg := fmt.Sprintf(":%s!%s@%s NICK :%s\r\n", oldNick, client.user, s.getConfig().Server.Host, newNick)
+					notified := map[uuid.UUID]bool{client.identifier: true}
+					conn.Write([]byte(nickMsg))
+
+					for roomID := range client.rooms {
+						s.RoomsMutex.Lock()
+						var room *Room
+						for i := range s.Rooms {
+							if s.Rooms[i].identifier == roomID {
+								room = &s.Rooms[i]
+								break
+							}
+						}
+						s.RoomsMutex.Unlock()
+						if room == nil {
+							continue
+						}
+						room.roomMux.Lock()
+						memberIDs := make([]uuid.UUID, 0, len(room.clients))
+						for id := range room.clients {
+							memberIDs = append(memberIDs, id)
+						}
+						room.roomMux.Unlock()
+						for _, id := range memberIDs {
+							if notified[id] {
+								continue
+							}
+							s.ClientsMutex.Lock()
+							for i := range s.Clients {
+								if s.Clients[i].identifier == id {
+									s.Clients[i].conn.Write([]byte(nickMsg))
+									notified[id] = true
+									break
+								}
+							}
+							s.ClientsMutex.Unlock()
+						}
+					}
+				} else {
+					log.Infof("NICK: Setting nickname to '%s'", newNick)
+					client.nick = newNick
+					if client.user == "" {
+						client.user = "*"
+					}
+				}
+				continue
+			} else if cmd == UserCmd && !client.registered {
 				// Command: USER Parameters: <user> <mode> <unused> <realname>
 				// Example: USER shout-user 0 * :Shout User
 				log.Infof("Processing USER command with args: '%s'", args)
 				if len(args) == 0 {
+					// RFC 2812: 461 ERR_NEEDMOREPARAMS (not 462)
 					log.Infof("USER: No parameters given")
-					send(conn, ":%s %s %s:You may not reregister\n", config.Values.Server.Host, ErrAlreadyRegistered, client.nick)
+					send(conn, ":%s %s %s USER :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, client.nick)
 					continue
 				}
-				split := strings.Split(args, ":")
+				split := strings.SplitN(args, ":", 2)
 				log.Infof("USER: split into %d parts", len(split))
-				if len(split) < 2 || len(strings.Split(split[0], " ")) < 3 {
+				if len(split) < 2 || len(strings.Fields(split[0])) < 3 {
 					log.Infof("USER: Not enough parameters")
-					send(conn, ":%s %s %s USER :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, client.nick)
+					send(conn, ":%s %s %s USER :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, client.nick)
 					continue
 				}
-				args1 := split[0]
+				args1fields := strings.Fields(split[0])
 				args2 := split[1]
 
-				client.user = strings.Split(args1, " ")[0]
-				client.mode, _ = strconv.Atoi(strings.Split(args1, " ")[1])
-				client.unused = strings.Split(args1, " ")[2]
+				client.user = args1fields[0]
+				client.mode, _ = strconv.Atoi(args1fields[1])
+				client.unused = args1fields[2]
 				client.realname = args2
 
 				// Attempt authentication if Redis is available and user provided password
@@ -518,11 +612,11 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 							}
 							log.Infof("USER: Successfully authenticated '%s' with registered account", client.nick)
 							send(conn, ":%s %s %s %s :You are now logged in as %s\n",
-								config.Values.Server.Host, RplLoggedIn, client.nick, client.accountName, client.accountName)
+								s.getConfig().Server.Host, RplLoggedIn, client.nick, client.accountName, client.accountName)
 						} else {
 							// Authentication failed
 							log.Warnf("USER: Password verification failed for registered account '%s'", client.nick)
-							send(conn, ":%s %s :Password incorrect\n", config.Values.Server.Host, ErrPasswdMismatch)
+							send(conn, ":%s %s :Password incorrect\n", s.getConfig().Server.Host, ErrPasswdMismatch)
 							// Clear password and continue without authentication
 							client.password = ""
 						}
@@ -534,50 +628,62 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					client.password = ""
 				}
 
+				// Registration requires both NICK and USER.
+				if client.nick == "" {
+					// User sent USER before NICK; need to wait for NICK.
+					// Store user params; registration completes when NICK arrives.
+					// (clients that send NICK first are handled above)
+					log.Infof("USER: nick not set yet, storing user params and waiting for NICK")
+					continue
+				}
 				log.Infof("USER: Calling AddClient for nick='%s', user='%s', realname='%s', authenticated=%v",
 					client.nick, client.user, client.realname, client.authenticated)
 				s.AddClient(client)
-				initCompleted = true
+				client.registered = true
 				log.Infof("USER: Registration completed")
-			} else if cmd == PingCmd && initCompleted {
+
+				// Start per-client PING goroutine if configured.
+				if s.PingInterval > 0 {
+					go s.pingClient(conn, client.identifier)
+				}
+			} else if cmd == PingCmd {
 				if len(args) == 0 {
-					send(conn, ":%s %s :No origin specified\n", config.Values.Server.Host, ErrNoOrigin)
+					send(conn, ":%s %s :No origin specified\n", s.getConfig().Server.Host, ErrNoOrigin)
 					continue
 				}
-				origins := strings.Split(args, " ")
-				if len(origins) == 1 {
-					send(conn, ":%s %s %s\n", config.Values.Server.Host, PingPongCmd, args)
-				} else {
-					// query other server as well for now just answer
-					// ...
-					send(conn, ":%s %s %s\n", config.Values.Server.Host, PingPongCmd, args)
-				}
-			} else if cmd == JoinCmd && initCompleted {
+				send(conn, ":%s %s %s\n", s.getConfig().Server.Host, PingPongCmd, args)
+			} else if cmd == PingPongCmd {
+				// Client PONG in response to our PING: reset the read deadline.
+				conn.SetReadDeadline(time.Now().Add(s.ClientTimeout))
+			} else if cmd == JoinCmd && client.registered {
 				if len(args) == 0 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, JoinCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, JoinCmd)
 					continue
 				}
 				rooms := strings.Split(args, ",")
 				for _, roomName := range rooms {
 					s.JoinRoomByName(client, roomName)
 				}
-			} else if cmd == PrivmsgCmd && initCompleted {
+			} else if cmd == PrivmsgCmd && client.registered {
 				if len(args) == 0 {
-					send(conn, ":%s %s :No recipient given\n", config.Values.Server.Host, ErrNoRecipient)
+					send(conn, ":%s %s :No recipient given\n", s.getConfig().Server.Host, ErrNoRecipient)
 					continue
 				}
-				parts := strings.Split(args, ":")
+				// RFC 1459: PRIVMSG <target> :<text>
+				// The trailing parameter starts at the first " :" — use SplitN to
+				// preserve colons in the message body.
+				parts := strings.SplitN(args, " :", 2)
 				if len(parts) < 2 {
-					send(conn, ":%s %s :No text to send\n", config.Values.Server.Host, ErrNoTextToSend)
+					send(conn, ":%s %s :No text to send\n", s.getConfig().Server.Host, ErrNoTextToSend)
 					continue
 				}
 				target := strings.TrimSpace(parts[0])
-				chatMessage := strings.TrimSpace(parts[1])
+				chatMessage := parts[1]
 				if strings.HasPrefix(target, "#") || strings.HasPrefix(target, "$") {
 					// is channel or mask
 					if validMessageMask(target) {
 
-						fmt.Printf("Masking is not implemented, so we just swallow that message: %s\n", args)
+						log.Infof("Masking is not implemented, swallowing message: %s", args)
 						// ERR_WILDTOPLEVEL
 						// ERR_NOTOPLEVEL
 						// ERR_TOOMANYTARGETS
@@ -590,68 +696,117 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 								}
 								for _, cli := range s.Clients {
 									if ident == cli.identifier {
-										send(cli.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, config.Values.Server.Host, PrivmsgCmd, target, chatMessage)
+										send(cli.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, s.getConfig().Server.Host, PrivmsgCmd, target, chatMessage)
 									}
 								}
 							}
 							room.roomMux.Unlock()
 						} else {
-							send(conn, ":%s %s %s %s :Cannot send to channel\n", config.Values.Server.Host, ErrCannotSendToChan, client.nick, target)
+							send(conn, ":%s %s %s %s :Cannot send to channel\n", s.getConfig().Server.Host, ErrCannotSendToChan, client.nick, target)
 						}
 					}
 				} else if validNickCharset(target) {
 					// not a channel or mask, let's find out if the requested user is connected
 					targetClient := s.ClientByName(target)
 					if targetClient.nick == "" {
-						send(conn, ":%s %s %s %s :No such nick/channel\n", config.Values.Server.Host, ErrNoSuchNick, client.nick, target)
+						send(conn, ":%s %s %s %s :No such nick/channel\n", s.getConfig().Server.Host, ErrNoSuchNick, client.nick, target)
 					} else {
-						send(targetClient.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, config.Values.Server.Host, PrivmsgCmd, target, chatMessage)
+						send(targetClient.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, s.getConfig().Server.Host, PrivmsgCmd, target, chatMessage)
 					}
 				}
-			} else if cmd == PartCmd && initCompleted {
+			} else if cmd == PartCmd && client.registered {
 				if len(args) == 0 {
-					send(conn, ":%s %s :No recipient given\n", config.Values.Server.Host, ErrNoRecipient)
+					send(conn, ":%s %s :No recipient given\n", s.getConfig().Server.Host, ErrNoRecipient)
 					continue
 				}
-				parts := strings.Split(args, ":")
-				partTargets := strings.Split(strings.TrimSpace(parts[0]), ",")
+				// RFC: PART <channel>{,<channel>} [:<reason>]
+				partParts := strings.SplitN(args, " :", 2)
+				partTargets := strings.Split(strings.TrimSpace(partParts[0]), ",")
 				partMessage := ""
-				if len(parts) >= 2 {
-					partMessage = strings.TrimSpace(parts[1])
+				if len(partParts) >= 2 {
+					partMessage = partParts[1]
 				}
 
 				for _, target := range partTargets {
-					if s.RoomExists(target) {
-						if inChannel, room := s.IsUserInRoom(client, target); inChannel {
-							room.roomMux.Lock()
-							defer room.roomMux.Unlock()
-							for ident := range room.clients {
-								fmt.Printf("exists %d, %s, %s, %s\n", 2, room.name, ident, client.identifier)
-								if ident != client.identifier {
-									continue
-								}
-								for _, cli := range s.Clients {
-									send(cli.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, config.Values.Server.Host, PartCmd, target, partMessage)
-									if ident == cli.identifier {
-										delete(room.clients, client.identifier) // remove user from room
-										s.ClientsMutex.Lock()
-										defer s.ClientsMutex.Unlock()
-										delete(client.rooms, room.identifier) // remove room from users rooms list
-									}
-								}
-							}
-						} else {
-							send(conn, ":%s %s %s :You're not on that channel\n", config.Values.Server.Host, ErrNotOnChannel, target)
+					target = strings.TrimSpace(target)
+					if !s.RoomExists(target) {
+						send(conn, ":%s %s %s :No such channel\n", s.getConfig().Server.Host, ErrNoSuchChannel, target)
+						continue
+					}
+					inChannel, room := s.IsUserInRoom(client, target)
+					if !inChannel {
+						send(conn, ":%s %s %s :You're not on that channel\n", s.getConfig().Server.Host, ErrNotOnChannel, target)
+						continue
+					}
+
+					// Collect channel members while holding the lock briefly,
+					// then release before sending. This avoids defer-in-loop deadlock.
+					room.roomMux.Lock()
+					memberIDs := make([]uuid.UUID, 0, len(room.clients))
+					for id := range room.clients {
+						memberIDs = append(memberIDs, id)
+					}
+					delete(room.clients, client.identifier)
+					room.roomMux.Unlock()
+
+					// Remove room from client's room list.
+					delete(client.rooms, room.identifier)
+
+					// Update server's copy of client.
+					s.ClientsMutex.Lock()
+					for i := range s.Clients {
+						if s.Clients[i].identifier == client.identifier {
+							delete(s.Clients[i].rooms, room.identifier)
+							break
 						}
-					} else {
-						send(conn, ":%s %s %s :No such channel\n", config.Values.Server.Host, ErrNoSuchChannel, target)
+					}
+					s.ClientsMutex.Unlock()
+
+					// Send PART only to channel members (not all clients).
+					partMsg := fmt.Sprintf(":%s!%s@%s %s %s :%s\r\n",
+						client.nick, client.user, s.getConfig().Server.Host, PartCmd, target, partMessage)
+					s.ClientsMutex.Lock()
+					for _, memberID := range memberIDs {
+						for i := range s.Clients {
+							if s.Clients[i].identifier == memberID {
+								s.Clients[i].conn.Write([]byte(partMsg))
+								break
+							}
+						}
+					}
+					// Also send PART to the parting client themselves (they were in memberIDs before removal).
+					conn.Write([]byte(partMsg))
+					s.ClientsMutex.Unlock()
+
+					// Update Redis if enabled.
+					if s.RedisClient != nil {
+						ctx := context.Background()
+						channelName := target
+						if !strings.HasPrefix(channelName, "#") {
+							channelName = "#" + channelName
+						}
+						if err := s.RedisClient.PartChannel(ctx, client.identifier.String(), channelName); err != nil {
+							log.Errorf("Failed to part channel in Redis: %v", err)
+						}
+						event := redis.Event{
+							Type: "PART",
+							Data: map[string]interface{}{
+								"uuid":    client.identifier.String(),
+								"nick":    client.nick,
+								"channel": channelName,
+								"message": partMessage,
+							},
+						}
+						if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
+							log.Errorf("Failed to publish PART event: %v", err)
+						}
 					}
 				}
-			} else if cmd == WhoisCmd && initCompleted {
+			} else if cmd == WhoisCmd && client.registered {
 				// Command: WHOIS <nickname>
 				// Returns information about the specified user
 				if len(args) == 0 {
-					send(conn, ":%s %s :No nickname given\n", config.Values.Server.Host, ErrNoRecipient)
+					send(conn, ":%s %s :No nickname given\n", s.getConfig().Server.Host, ErrNoRecipient)
 					continue
 				}
 				targetNick := strings.TrimSpace(args)
@@ -669,12 +824,12 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if targetClient == nil {
 					// User not found
-					send(conn, ":%s %s %s :No such nick/channel\n", config.Values.Server.Host, ErrNoSuchNick, targetNick)
+					send(conn, ":%s %s %s :No such nick/channel\n", s.getConfig().Server.Host, ErrNoSuchNick, targetNick)
 				} else {
 					// RPL_WHOISUSER: 311 <nick> <user> <host> * :<real name>
 					send(conn, ":%s %s %s %s %s %s * :%s\n",
-						config.Values.Server.Host, RplWhoisUser, client.nick,
-						targetClient.nick, targetClient.user, config.Values.Server.Host, targetClient.realname)
+						s.getConfig().Server.Host, RplWhoisUser, client.nick,
+						targetClient.nick, targetClient.user, s.getConfig().Server.Host, targetClient.realname)
 
 					// RPL_WHOISCHANNELS: 319 <nick> :<channels>
 					if len(targetClient.rooms) > 0 {
@@ -701,36 +856,36 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						}
 						if len(channels) > 0 {
 							send(conn, ":%s %s %s %s :%s\n",
-								config.Values.Server.Host, RplWhoIsChannels, client.nick,
+								s.getConfig().Server.Host, RplWhoIsChannels, client.nick,
 								targetClient.nick, strings.Join(channels, " "))
 						}
 					}
 
 					// RPL_WHOISSERVER: 312 <nick> <server> :<server info>
 					send(conn, ":%s %s %s %s %s :%s\n",
-						config.Values.Server.Host, RplWhoisServer, client.nick,
-						targetClient.nick, config.Values.Server.Name, config.Values.Server.Host)
+						s.getConfig().Server.Host, RplWhoisServer, client.nick,
+						targetClient.nick, s.getConfig().Server.Name, s.getConfig().Server.Host)
 
 					// RPL_WHOISOPERATOR: 313 <nick> :is an IRC operator (if applicable)
 					if targetClient.operator {
 						send(conn, ":%s %s %s %s :is an IRC operator\n",
-							config.Values.Server.Host, RplWhoisOperator, client.nick, targetClient.nick)
+							s.getConfig().Server.Host, RplWhoisOperator, client.nick, targetClient.nick)
 					}
 
 					// RPL_ENDOFWHOIS: 318 <nick> :End of WHOIS list
 					send(conn, ":%s %s %s %s :End of WHOIS list\n",
-						config.Values.Server.Host, RplEndOfWhois, client.nick, targetClient.nick)
+						s.getConfig().Server.Host, RplEndOfWhois, client.nick, targetClient.nick)
 				}
-			} else if cmd == KickCmd && initCompleted {
+			} else if cmd == KickCmd && client.registered {
 				// Command: KICK <channel> <user> [<comment>]
 				// Kicks a user out of a channel (requires operator privileges)
 				if len(args) == 0 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, KickCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, KickCmd)
 					continue
 				}
 				parts := strings.SplitN(args, " ", 2)
 				if len(parts) < 2 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, KickCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, KickCmd)
 					continue
 				}
 
@@ -755,14 +910,14 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				// Check if channel exists
 				if !s.RoomExists(channelName) {
-					send(conn, ":%s %s %s :No such channel\n", config.Values.Server.Host, ErrNoSuchChannel, channelName)
+					send(conn, ":%s %s %s :No such channel\n", s.getConfig().Server.Host, ErrNoSuchChannel, channelName)
 					continue
 				}
 
 				// Check if kicker is in the channel
 				inChannel, room := s.IsUserInRoom(client, channelName)
 				if !inChannel {
-					send(conn, ":%s %s %s :You're not on that channel\n", config.Values.Server.Host, ErrNotOnChannel, channelName)
+					send(conn, ":%s %s %s :You're not on that channel\n", s.getConfig().Server.Host, ErrNotOnChannel, channelName)
 					continue
 				}
 
@@ -779,7 +934,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				room.roomMux.Unlock()
 
 				if !isOp && !isFounder {
-					send(conn, ":%s %s %s :You're not channel operator\n", config.Values.Server.Host, ErrChanOpPrivsNeeded, channelName)
+					send(conn, ":%s %s %s :You're not channel operator\n", s.getConfig().Server.Host, ErrChanOpPrivsNeeded, channelName)
 					continue
 				}
 
@@ -795,7 +950,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				s.ClientsMutex.Unlock()
 
 				if targetClient == nil {
-					send(conn, ":%s %s %s :No such nick/channel\n", config.Values.Server.Host, ErrNoSuchNick, targetNick)
+					send(conn, ":%s %s %s :No such nick/channel\n", s.getConfig().Server.Host, ErrNoSuchNick, targetNick)
 					continue
 				}
 
@@ -809,7 +964,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if !targetInChannel {
 					send(conn, ":%s %s %s %s :They aren't on that channel\n",
-						config.Values.Server.Host, ErrUserNotInChannel, targetNick, channelName)
+						s.getConfig().Server.Host, ErrUserNotInChannel, targetNick, channelName)
 					continue
 				}
 
@@ -819,7 +974,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					for i := range s.Clients {
 						if s.Clients[i].identifier == memberID {
 							send(s.Clients[i].conn, ":%s!%s@%s KICK %s %s :%s\n",
-								client.nick, client.user, config.Values.Server.Host,
+								client.nick, client.user, s.getConfig().Server.Host,
 								channelName, targetNick, kickReason)
 							break
 						}
@@ -844,16 +999,16 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				s.ClientsMutex.Unlock()
 
 				log.Infof("[KICK] %s kicked %s from %s: %s", client.nick, targetNick, channelName, kickReason)
-			} else if cmd == InviteCmd && initCompleted {
+			} else if cmd == InviteCmd && client.registered {
 				// Command: INVITE <nickname> <channel>
 				// Invites a user to a channel
 				if len(args) == 0 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, InviteCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, InviteCmd)
 					continue
 				}
 				parts := strings.SplitN(args, " ", 2)
 				if len(parts) < 2 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, InviteCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, InviteCmd)
 					continue
 				}
 
@@ -862,14 +1017,14 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				// Check if channel exists
 				if !s.RoomExists(channelName) {
-					send(conn, ":%s %s %s :No such channel\n", config.Values.Server.Host, ErrNoSuchChannel, channelName)
+					send(conn, ":%s %s %s :No such channel\n", s.getConfig().Server.Host, ErrNoSuchChannel, channelName)
 					continue
 				}
 
 				// Check if inviter is in the channel
 				inChannel, room := s.IsUserInRoom(client, channelName)
 				if !inChannel {
-					send(conn, ":%s %s %s :You're not on that channel\n", config.Values.Server.Host, ErrNotOnChannel, channelName)
+					send(conn, ":%s %s %s :You're not on that channel\n", s.getConfig().Server.Host, ErrNotOnChannel, channelName)
 					continue
 				}
 
@@ -885,7 +1040,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				s.ClientsMutex.Unlock()
 
 				if targetClient == nil {
-					send(conn, ":%s %s %s :No such nick/channel\n", config.Values.Server.Host, ErrNoSuchNick, targetNick)
+					send(conn, ":%s %s %s :No such nick/channel\n", s.getConfig().Server.Host, ErrNoSuchNick, targetNick)
 					continue
 				}
 
@@ -899,22 +1054,22 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if targetInChannel {
 					send(conn, ":%s %s %s %s :is already on channel\n",
-						config.Values.Server.Host, ErrUserOnChannel, targetNick, channelName)
+						s.getConfig().Server.Host, ErrUserOnChannel, targetNick, channelName)
 					continue
 				}
 
 				// Send INVITE notification to target user
 				send(targetClient.conn, ":%s!%s@%s INVITE %s %s\n",
-					client.nick, client.user, config.Values.Server.Host,
+					client.nick, client.user, s.getConfig().Server.Host,
 					targetNick, channelName)
 
 				// Send RPL_INVITING confirmation to inviter
 				send(conn, ":%s %s %s %s %s\n",
-					config.Values.Server.Host, RplInviting, client.nick,
+					s.getConfig().Server.Host, RplInviting, client.nick,
 					channelName, targetNick)
 
 				log.Infof("[INVITE] %s invited %s to %s", client.nick, targetNick, channelName)
-			} else if cmd == ListCmd && initCompleted {
+			} else if cmd == ListCmd && client.registered {
 				// Command: LIST [<channel>{,<channel>}]
 				// Lists channels and their topics
 				log.Infof("[LIST] %s requested channel list: '%s'", client.nick, args)
@@ -969,21 +1124,21 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 						// Format: :server 322 <nick> <channel> <# visible> :<topic>
 						send(conn, ":%s %s %s #%s %d :%s\n",
-							config.Values.Server.Host, RplList, client.nick,
+							s.getConfig().Server.Host, RplList, client.nick,
 							channelName, visibleCount, topic)
 					}
 				}
 
 				// Send RPL_LISTEND
 				send(conn, ":%s %s %s :End of LIST\n",
-					config.Values.Server.Host, RplListEnd, client.nick)
+					s.getConfig().Server.Host, RplListEnd, client.nick)
 
 				log.Infof("[LIST] Sent %d channels to %s", len(channelsToList), client.nick)
-			} else if cmd == TopicCmd && initCompleted {
+			} else if cmd == TopicCmd && client.registered {
 				// Command: TOPIC <channel> [<topic>]
 				// Query or set channel topic
 				if len(args) == 0 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, TopicCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, TopicCmd)
 					continue
 				}
 				parts := strings.SplitN(args, ":", 2)
@@ -991,21 +1146,21 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				// Check if channel exists
 				if !s.RoomExists(channelName) {
-					send(conn, ":%s %s %s :No such channel\n", config.Values.Server.Host, ErrNoSuchChannel, channelName)
+					send(conn, ":%s %s %s :No such channel\n", s.getConfig().Server.Host, ErrNoSuchChannel, channelName)
 					continue
 				}
 
 				// Check if user is in the channel
 				inChannel, _ := s.IsUserInRoom(client, channelName)
 				if !inChannel {
-					send(conn, ":%s %s %s :You're not on that channel\n", config.Values.Server.Host, ErrNotOnChannel, channelName)
+					send(conn, ":%s %s %s :You're not on that channel\n", s.getConfig().Server.Host, ErrNotOnChannel, channelName)
 					continue
 				}
 
 				// Get the actual room pointer from server's slice
 				room := s.GetRoom(channelName)
 				if room == nil {
-					send(conn, ":%s %s %s :No such channel\n", config.Values.Server.Host, ErrNoSuchChannel, channelName)
+					send(conn, ":%s %s %s :No such channel\n", s.getConfig().Server.Host, ErrNoSuchChannel, channelName)
 					continue
 				}
 
@@ -1018,11 +1173,11 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					if topic == "" {
 						// RPL_NOTOPIC: 331 <client> <channel> :No topic is set
 						send(conn, ":%s %s %s %s :No topic is set\n",
-							config.Values.Server.Host, RplNoTopic, client.nick, channelName)
+							s.getConfig().Server.Host, RplNoTopic, client.nick, channelName)
 					} else {
 						// RPL_TOPIC: 332 <client> <channel> :<topic>
 						send(conn, ":%s %s %s %s :%s\n",
-							config.Values.Server.Host, RplTopic, client.nick, channelName, topic)
+							s.getConfig().Server.Host, RplTopic, client.nick, channelName, topic)
 					}
 					log.Infof("[TOPIC] %s queried topic for %s", client.nick, channelName)
 				} else {
@@ -1044,7 +1199,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 					if topicLocked && !isOp && !isFounder {
 						send(conn, ":%s %s %s :You're not channel operator\n",
-							config.Values.Server.Host, ErrChanOpPrivsNeeded, channelName)
+							s.getConfig().Server.Host, ErrChanOpPrivsNeeded, channelName)
 						log.Infof("[TOPIC] %s denied setting topic for %s (not operator/founder)", client.nick, channelName)
 						continue
 					}
@@ -1068,7 +1223,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						for i := range s.Clients {
 							if s.Clients[i].identifier == ident {
 								send(s.Clients[i].conn, ":%s!%s@%s TOPIC %s :%s\n",
-									client.nick, client.user, config.Values.Server.Host,
+									client.nick, client.user, s.getConfig().Server.Host,
 									channelName, newTopic)
 								break
 							}
@@ -1078,18 +1233,18 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 					log.Infof("[TOPIC] %s set topic for %s: %s", client.nick, channelName, newTopic)
 				}
-			} else if cmd == OperCmd && initCompleted {
+			} else if cmd == OperCmd && client.registered {
 				// Command: OPER <username> <password>
 				// Authenticate as IRC operator
 				if len(args) == 0 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, OperCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, OperCmd)
 					continue
 				}
 
 				// Parse username and password
 				parts := strings.Fields(args)
 				if len(parts) < 2 {
-					send(conn, ":%s %s %s :Not enough parameters\n", config.Values.Server.Host, ErrNeedMoreParams, OperCmd)
+					send(conn, ":%s %s %s :Not enough parameters\n", s.getConfig().Server.Host, ErrNeedMoreParams, OperCmd)
 					log.Infof("[OPER] %s failed: insufficient parameters", client.nick)
 					continue
 				}
@@ -1102,7 +1257,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Load users from config
 				users, err := config.LoadUsers()
 				if err != nil {
-					send(conn, ":%s %s :Configuration error\n", config.Values.Server.Host, ErrPasswdMismatch)
+					send(conn, ":%s %s :Configuration error\n", s.getConfig().Server.Host, ErrPasswdMismatch)
 					log.Errorf("[OPER] Failed to load users: %v", err)
 					continue
 				}
@@ -1111,7 +1266,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				user, authenticated := config.AuthenticateUser(username, password, users)
 				if !authenticated {
 					// ERR_PASSWDMISMATCH: 464 :Password incorrect
-					send(conn, ":%s %s :Password incorrect\n", config.Values.Server.Host, ErrPasswdMismatch)
+					send(conn, ":%s %s :Password incorrect\n", s.getConfig().Server.Host, ErrPasswdMismatch)
 					log.Infof("[OPER] %s failed: invalid credentials for '%s'", client.nick, username)
 					continue
 				}
@@ -1119,7 +1274,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Check if user has operator privileges
 				if !user.IsOper {
 					// ERR_NOOPERHOST: 491 :No O-lines for your host
-					send(conn, ":%s %s :No O-lines for your host\n", config.Values.Server.Host, ErrNoOperHost)
+					send(conn, ":%s %s :No O-lines for your host\n", s.getConfig().Server.Host, ErrNoOperHost)
 					log.Infof("[OPER] %s failed: '%s' is not authorized as operator", client.nick, username)
 					continue
 				}
@@ -1159,9 +1314,9 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				// RPL_YOUREOPER: 381 :You are now an IRC operator
 				send(conn, ":%s %s %s :You are now an IRC operator\n",
-					config.Values.Server.Host, RplYoureOper, client.nick)
+					s.getConfig().Server.Host, RplYoureOper, client.nick)
 				log.Infof("[OPER] %s successfully authenticated as operator '%s'", client.nick, username)
-			} else if cmd == NoticeCmd && initCompleted {
+			} else if cmd == NoticeCmd && client.registered {
 				// Command: NOTICE <target> :<message>
 				// Similar to PRIVMSG but must not trigger automatic replies
 				if len(args) == 0 {
@@ -1169,7 +1324,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					log.Infof("[NOTICE] No recipient given, failing silently")
 					continue
 				} else {
-					parts := strings.Split(args, ":")
+					parts := strings.SplitN(args, " :", 2)
 					if len(parts) < 2 {
 						// NOTICE should fail silently
 						log.Infof("[NOTICE] No text to send, failing silently")
@@ -1177,7 +1332,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					}
 
 					target := strings.TrimSpace(parts[0])
-					noticeMessage := strings.TrimSpace(parts[1])
+					noticeMessage := parts[1]
 
 					if len(target) == 0 || len(noticeMessage) == 0 {
 						// NOTICE should fail silently
@@ -1202,7 +1357,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 									for _, cli := range s.Clients {
 										if ident == cli.identifier {
 											send(cli.conn, ":%s!%s@%s %s %s :%s\n",
-												client.nick, client.user, config.Values.Server.Host,
+												client.nick, client.user, s.getConfig().Server.Host,
 												NoticeCmd, target, noticeMessage)
 										}
 									}
@@ -1222,13 +1377,13 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 							log.Infof("[NOTICE] Target user %s not found, failing silently", target)
 						} else {
 							send(targetClient.conn, ":%s!%s@%s %s %s :%s\n",
-								client.nick, client.user, config.Values.Server.Host,
+								client.nick, client.user, s.getConfig().Server.Host,
 								NoticeCmd, target, noticeMessage)
 							log.Infof("[NOTICE] %s sent notice to %s", client.nick, target)
 						}
 					}
 				}
-			} else if cmd == KillCmd && initCompleted {
+			} else if cmd == KillCmd && client.registered {
 				// Command: KILL <nickname> :<reason>
 				// Operator command to forcefully disconnect a user
 				log.Infof("[KILL] %s attempting KILL: '%s'", client.nick, args)
@@ -1236,7 +1391,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Check if user is operator
 				if !client.operator {
 					send(conn, ":%s %s :Permission denied- You're not an IRC operator\n",
-						config.Values.Server.Host, ErrNoPrivileges)
+						s.getConfig().Server.Host, ErrNoPrivileges)
 					log.Infof("[KILL] %s denied - not an operator", client.nick)
 					continue
 				}
@@ -1245,7 +1400,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				parts := strings.SplitN(args, ":", 2)
 				if len(parts) < 2 {
 					send(conn, ":%s %s %s :Not enough parameters\n",
-						config.Values.Server.Host, ErrNeedMoreParams, KillCmd)
+						s.getConfig().Server.Host, ErrNeedMoreParams, KillCmd)
 					continue
 				}
 
@@ -1254,7 +1409,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if len(targetNick) == 0 {
 					send(conn, ":%s %s * :No such nick/channel\n",
-						config.Values.Server.Host, ErrNoSuchNick)
+						s.getConfig().Server.Host, ErrNoSuchNick)
 					continue
 				}
 
@@ -1271,7 +1426,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if targetClient == nil || targetClient.nick == "" {
 					send(conn, ":%s %s %s :No such nick/channel\n",
-						config.Values.Server.Host, ErrNoSuchNick, targetNick)
+						s.getConfig().Server.Host, ErrNoSuchNick, targetNick)
 					log.Infof("[KILL] Target %s not found", targetNick)
 					continue
 				}
@@ -1283,7 +1438,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// This lets other users know this client has been killed
 				if targetClient.nick != "" {
 					quitMsg := fmt.Sprintf(":%s!%s@%s QUIT :Killed: %s\r\n",
-						targetClient.nick, targetClient.user, config.Values.Server.Host, killMsg)
+						targetClient.nick, targetClient.user, s.getConfig().Server.Host, killMsg)
 
 					// Collect all unique clients in the same rooms
 					notifiedClients := make(map[uuid.UUID]bool)
@@ -1352,7 +1507,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Remove client from server
 				s.RemoveClient(targetClient.identifier)
 
-			} else if cmd == WallopsCmd && initCompleted {
+			} else if cmd == WallopsCmd && client.registered {
 				// Command: WALLOPS :<message>
 				// Send message to all users with +w (wallops) mode set
 				log.Infof("[WALLOPS] %s sending wallops: '%s'", client.nick, args)
@@ -1360,7 +1515,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Check if user is operator
 				if !client.operator {
 					send(conn, ":%s %s :Permission denied- You're not an IRC operator\n",
-						config.Values.Server.Host, ErrNoPrivileges)
+						s.getConfig().Server.Host, ErrNoPrivileges)
 					log.Infof("[WALLOPS] %s denied - not an operator", client.nick)
 					continue
 				}
@@ -1375,13 +1530,13 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if len(message) == 0 {
 					send(conn, ":%s %s %s :Not enough parameters\n",
-						config.Values.Server.Host, ErrNeedMoreParams, WallopsCmd)
+						s.getConfig().Server.Host, ErrNeedMoreParams, WallopsCmd)
 					continue
 				}
 
 				// Send to all users with +w mode
 				wallopsMsg := fmt.Sprintf(":%s!%s@%s WALLOPS :%s\r\n",
-					client.nick, client.user, config.Values.Server.Host, message)
+					client.nick, client.user, s.getConfig().Server.Host, message)
 
 				s.ClientsMutex.Lock()
 				count := 0
@@ -1414,7 +1569,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				log.Infof("[WALLOPS] %s sent wallops to %d users", client.nick, count)
 
-			} else if cmd == ChanRegCmd && initCompleted {
+			} else if cmd == ChanRegCmd && client.registered {
 				// Command: CHANREG <#channel> [:<description>]
 				// Register a channel and become its founder
 				log.Infof("[CHANREG] %s attempting to register channel: '%s'", client.nick, args)
@@ -1422,7 +1577,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Must be authenticated
 				if !client.authenticated || client.accountName == "" {
 					send(conn, ":%s %s :You must be logged in to register a channel\n",
-						config.Values.Server.Host, ErrAccountRequired)
+						s.getConfig().Server.Host, ErrAccountRequired)
 					log.Infof("[CHANREG] %s denied - not authenticated", client.nick)
 					continue
 				}
@@ -1437,14 +1592,14 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					}
 				} else {
 					send(conn, ":%s %s %s :Not enough parameters\n",
-						config.Values.Server.Host, ErrNeedMoreParams, ChanRegCmd)
+						s.getConfig().Server.Host, ErrNeedMoreParams, ChanRegCmd)
 					continue
 				}
 
 				// Validate channel name
 				if !strings.HasPrefix(channelName, "#") || len(channelName) < 2 {
 					send(conn, ":%s %s %s :No such channel\n",
-						config.Values.Server.Host, ErrNoSuchChannel, channelName)
+						s.getConfig().Server.Host, ErrNoSuchChannel, channelName)
 					continue
 				}
 
@@ -1452,7 +1607,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				inChannel, room := s.IsUserInRoom(client, channelName)
 				if !inChannel {
 					send(conn, ":%s %s %s :You're not on that channel\n",
-						config.Values.Server.Host, ErrNotOnChannel, channelName)
+						s.getConfig().Server.Host, ErrNotOnChannel, channelName)
 					log.Infof("[CHANREG] %s denied - not in channel %s", client.nick, channelName)
 					continue
 				}
@@ -1465,7 +1620,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 				if !isOp && !isFounder {
 					send(conn, ":%s %s %s :You're not channel operator\n",
-						config.Values.Server.Host, ErrChanOpPrivsNeeded, channelName)
+						s.getConfig().Server.Host, ErrChanOpPrivsNeeded, channelName)
 					log.Infof("[CHANREG] %s denied - not operator in %s", client.nick, channelName)
 					continue
 				}
@@ -1479,7 +1634,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					}
 					if isRegistered {
 						send(conn, ":%s %s %s :Channel already registered\n",
-							config.Values.Server.Host, ErrChanRegisteredAlready, channelName)
+							s.getConfig().Server.Host, ErrChanRegisteredAlready, channelName)
 						log.Infof("[CHANREG] %s denied - %s already registered", client.nick, channelName)
 						continue
 					}
@@ -1488,7 +1643,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					err = s.RedisClient.RegisterChannel(ctx, channelName, client.accountName, description)
 					if err != nil {
 						send(conn, ":%s %s :Failed to register channel\n",
-							config.Values.Server.Host, ErrNoSuchService)
+							s.getConfig().Server.Host, ErrNoSuchService)
 						log.Errorf("[CHANREG] Failed to register %s: %v", channelName, err)
 						continue
 					}
@@ -1501,17 +1656,17 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 					// Success!
 					send(conn, ":%s %s %s :Channel registered successfully\n",
-						config.Values.Server.Host, RplChanRegistered, channelName)
+						s.getConfig().Server.Host, RplChanRegistered, channelName)
 					log.Infof("[CHANREG] %s successfully registered %s as founder %s",
 						client.nick, channelName, client.accountName)
 				} else {
 					// No Redis - cannot register channels
 					send(conn, ":%s %s :Channel registration requires Redis\n",
-						config.Values.Server.Host, ErrNoSuchService)
+						s.getConfig().Server.Host, ErrNoSuchService)
 					log.Infof("[CHANREG] %s denied - Redis not available", client.nick)
 				}
 
-			} else if cmd == "NAMES" && initCompleted {
+			} else if cmd == "NAMES" && client.registered {
 				// Command: NAMES [<channel>{,<channel>}]
 				// Lists all visible users in specified channels or all channels
 				log.Infof("[NAMES] %s requested names: '%s'", client.nick, args)
@@ -1590,7 +1745,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						// Send RPL_NAMREPLY: 353 <client> = <channel> :<names>
 						if len(names) > 0 {
 							send(conn, ":%s %s %s = #%s :%s\n",
-								config.Values.Server.Host, RplNameReply, client.nick,
+								s.getConfig().Server.Host, RplNameReply, client.nick,
 								channelName, strings.Join(names, " "))
 						}
 					}
@@ -1600,16 +1755,16 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if len(channelsToList) > 0 {
 					for _, channelName := range channelsToList {
 						send(conn, ":%s %s %s #%s :End of NAMES list\n",
-							config.Values.Server.Host, RplEndOfNames, client.nick, channelName)
+							s.getConfig().Server.Host, RplEndOfNames, client.nick, channelName)
 					}
 				} else {
 					// No channels specified or user not in any channels
 					send(conn, ":%s %s %s * :End of NAMES list\n",
-						config.Values.Server.Host, RplEndOfNames, client.nick)
+						s.getConfig().Server.Host, RplEndOfNames, client.nick)
 				}
 
 				log.Infof("[NAMES] Sent names for %d channels to %s", len(channelsToList), client.nick)
-			} else if cmd == WhoCmd && initCompleted {
+			} else if cmd == WhoCmd && client.registered {
 				// Command: WHO [<mask>]
 				// Query information about users matching the mask
 				// If mask is a channel (starts with #), list users in that channel
@@ -1715,9 +1870,9 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 					// RPL_WHOREPLY: 352 <client> <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <real name>
 					send(conn, ":%s %s %s %s %s %s %s %s %s :0 %s\n",
-						config.Values.Server.Host, RplWhoReply, client.nick,
-						channelName, user.user, config.Values.Server.Host,
-						config.Values.Server.Host, user.nick, flags, user.realname)
+						s.getConfig().Server.Host, RplWhoReply, client.nick,
+						channelName, user.user, s.getConfig().Server.Host,
+						s.getConfig().Server.Host, user.nick, flags, user.realname)
 				}
 
 				// Send RPL_ENDOFWHO: 315 <client> <name> :End of WHO list
@@ -1726,10 +1881,10 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					endMask = "*"
 				}
 				send(conn, ":%s %s %s %s :End of WHO list\n",
-					config.Values.Server.Host, RplEndOfWho, client.nick, endMask)
+					s.getConfig().Server.Host, RplEndOfWho, client.nick, endMask)
 
 				log.Infof("[WHO] Sent WHO reply for %d users to %s", len(usersToList), client.nick)
-			} else if cmd == AwayCmd && initCompleted {
+			} else if cmd == AwayCmd && client.registered {
 				// Command: AWAY [:<message>]
 				// Set or unset away status
 				// AWAY with no args = unset away
@@ -1746,7 +1901,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 							// RPL_UNAWAY: 305 <client> :You are no longer marked as being away
 							send(conn, ":%s %s %s :You are no longer marked as being away\n",
-								config.Values.Server.Host, RplUnAway, client.nick)
+								s.getConfig().Server.Host, RplUnAway, client.nick)
 
 							log.Infof("[AWAY] %s is no longer away", client.nick)
 						} else {
@@ -1756,7 +1911,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 							// RPL_NOWAWAY: 306 <client> :You have been marked as being away
 							send(conn, ":%s %s %s :You have been marked as being away\n",
-								config.Values.Server.Host, RplNowAway, client.nick)
+								s.getConfig().Server.Host, RplNowAway, client.nick)
 
 							log.Infof("[AWAY] %s is now away: %s", client.nick, message)
 						}
@@ -1764,7 +1919,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					}
 				}
 				s.ClientsMutex.Unlock()
-			} else if cmd == VersionCmd && initCompleted {
+			} else if cmd == VersionCmd && client.registered {
 				// Command: VERSION [<target>]
 				// Returns the version of the server program
 				// For now we only support VERSION without target (query this server)
@@ -1773,21 +1928,21 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Format: 351 <client> <version>.<debuglevel> <server> :<comments>
 				versionStr := version.GetVersion()
 				debugLevel := "0"
-				serverName := config.Values.Server.Host
+				serverName := s.getConfig().Server.Host
 				comments := "IRC Server written in Go"
 
 				send(conn, ":%s %s %s %s.%s %s :%s\n",
-					config.Values.Server.Host, RplVersion, client.nick,
+					s.getConfig().Server.Host, RplVersion, client.nick,
 					versionStr, debugLevel, serverName, comments)
 
 				log.Infof("[VERSION] %s requested server version: %s", client.nick, versionStr)
-			} else if cmd == MotdCmd && initCompleted {
+			} else if cmd == MotdCmd && client.registered {
 				// Command: MOTD [<target>]
 				// Returns the Message of the Day
 				// For now we only support MOTD without target (query this server)
 
 				// RFC 1459: RPL_MOTDSTART "375", RPL_MOTD "372", RPL_ENDOFMOTD "376"
-				serverName := config.Values.Server.Host
+				serverName := s.getConfig().Server.Host
 
 				// Send MOTD start
 				send(conn, ":%s %s %s :- %s Message of the day -\n",
@@ -1814,7 +1969,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					serverName, RplEndOfMotd, client.nick)
 
 				log.Infof("[MOTD] %s requested MOTD", client.nick)
-			} else if cmd == IsonCmd && initCompleted {
+			} else if cmd == IsonCmd && client.registered {
 				// Command: ISON <nickname> [<nickname> ...]
 				// Check which of the specified nicknames are currently online
 				// Returns a space-separated list of online nicknames
@@ -1826,7 +1981,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if len(nicknames) == 0 {
 					// If no nicknames provided, return empty ISON reply
 					send(conn, ":%s %s %s :\n",
-						config.Values.Server.Host, RplIson, client.nick)
+						s.getConfig().Server.Host, RplIson, client.nick)
 					continue
 				}
 
@@ -1845,11 +2000,11 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Send RPL_ISON with space-separated list of online nicks
 				onlineList := strings.Join(onlineNicks, " ")
 				send(conn, ":%s %s %s :%s\n",
-					config.Values.Server.Host, RplIson, client.nick, onlineList)
+					s.getConfig().Server.Host, RplIson, client.nick, onlineList)
 
 				log.Infof("[ISON] %s checked %d nicknames, %d online",
 					client.nick, len(nicknames), len(onlineNicks))
-			} else if cmd == UserhostCmd && initCompleted {
+			} else if cmd == UserhostCmd && client.registered {
 				// Command: USERHOST <nickname> [<nickname> ...]
 				// Returns information about users including away status and operator status
 				// Format: nick[*]=<+|-><user>@<host>
@@ -1862,7 +2017,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if len(nicknames) == 0 {
 					// If no nicknames provided, return empty USERHOST reply
 					send(conn, ":%s %s %s :\n",
-						config.Values.Server.Host, RplUserhost, client.nick)
+						s.getConfig().Server.Host, RplUserhost, client.nick)
 					continue
 				}
 
@@ -1907,11 +2062,11 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				// Send RPL_USERHOST with space-separated list of replies
 				replyList := strings.Join(replies, " ")
 				send(conn, ":%s %s %s :%s\n",
-					config.Values.Server.Host, RplUserhost, client.nick, replyList)
+					s.getConfig().Server.Host, RplUserhost, client.nick, replyList)
 
 				log.Infof("[USERHOST] %s queried %d nicknames, %d found",
 					client.nick, len(nicknames), len(replies))
-			} else if cmd == ModeCmd && initCompleted {
+			} else if cmd == ModeCmd && client.registered {
 				// Command: MODE <target> [<modestring> [<mode arguments>...]]
 				// Two types: user modes and channel modes
 				// User mode: MODE nickname +/-flags
@@ -1920,7 +2075,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				parts := strings.Fields(args)
 				if len(parts) == 0 {
 					send(conn, ":%s %s %s :Not enough parameters\n",
-						config.Values.Server.Host, ErrNeedMoreParams, ModeCmd)
+						s.getConfig().Server.Host, ErrNeedMoreParams, ModeCmd)
 					continue
 				}
 
@@ -1946,7 +2101,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 
 						if room == nil {
 							send(conn, ":%s %s %s %s :No such channel\n",
-								config.Values.Server.Host, ErrNoSuchChannel, client.nick, target)
+								s.getConfig().Server.Host, ErrNoSuchChannel, client.nick, target)
 							continue
 						}
 
@@ -1973,7 +2128,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						}
 
 						send(conn, ":%s %s %s %s %s\n",
-							config.Values.Server.Host, RplChannelModeIs, client.nick, room.name, modeStr.String())
+							s.getConfig().Server.Host, RplChannelModeIs, client.nick, room.name, modeStr.String())
 						log.Infof("[MODE] %s queried modes for %s: %s", client.nick, room.name, modeStr.String())
 					} else {
 						// Set channel modes
@@ -1997,7 +2152,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						if room == nil {
 							s.RoomsMutex.Unlock()
 							send(conn, ":%s %s %s %s :No such channel\n",
-								config.Values.Server.Host, ErrNoSuchChannel, client.nick, target)
+								s.getConfig().Server.Host, ErrNoSuchChannel, client.nick, target)
 							continue
 						}
 
@@ -2005,7 +2160,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						if !room.operators[client.identifier] && !room.founders[client.identifier] {
 							s.RoomsMutex.Unlock()
 							send(conn, ":%s %s %s %s :You're not channel operator\n",
-								config.Values.Server.Host, ErrChanOpPrivsNeeded, client.nick, target)
+								s.getConfig().Server.Host, ErrChanOpPrivsNeeded, client.nick, target)
 							continue
 						}
 
@@ -2127,7 +2282,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						// Query user modes (only own modes)
 						if !strings.EqualFold(target, client.nick) {
 							send(conn, ":%s %s %s :Cannot view modes for other users\n",
-								config.Values.Server.Host, ErrUsersDontMatch, client.nick)
+								s.getConfig().Server.Host, ErrUsersDontMatch, client.nick)
 							continue
 						}
 
@@ -2148,13 +2303,13 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						}
 
 						send(conn, ":%s %s %s %s\n",
-							config.Values.Server.Host, RplUModeIs, client.nick, modeStr.String())
+							s.getConfig().Server.Host, RplUModeIs, client.nick, modeStr.String())
 						log.Infof("[MODE] %s queried own user modes: %s", client.nick, modeStr.String())
 					} else {
 						// Set user modes (only own modes)
 						if !strings.EqualFold(target, client.nick) {
 							send(conn, ":%s %s %s :Cannot change mode for other users\n",
-								config.Values.Server.Host, ErrUsersDontMatch, client.nick)
+								s.getConfig().Server.Host, ErrUsersDontMatch, client.nick)
 							continue
 						}
 
@@ -2204,7 +2359,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						}
 					}
 				}
-			} else if cmd == SetPassCmd && initCompleted {
+			} else if cmd == SetPassCmd && client.registered {
 				// Command: SETPASS <oldpassword> <newpassword>
 				// Change password for authenticated account
 				log.Infof("Processing SETPASS command")
@@ -2212,7 +2367,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if !client.authenticated {
 					log.Infof("SETPASS: User '%s' not authenticated", client.nick)
 					send(conn, ":%s %s :You must be logged in to change your password\n",
-						config.Values.Server.Host, ErrAccountRequired)
+						s.getConfig().Server.Host, ErrAccountRequired)
 					continue
 				}
 
@@ -2220,7 +2375,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if len(parts) < 2 {
 					log.Infof("SETPASS: Not enough parameters")
 					send(conn, ":%s %s %s :Not enough parameters (usage: SETPASS <oldpassword> <newpassword>)\n",
-						config.Values.Server.Host, ErrNeedMoreParams, SetPassCmd)
+						s.getConfig().Server.Host, ErrNeedMoreParams, SetPassCmd)
 					continue
 				}
 
@@ -2233,7 +2388,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 				if !IsValidPassword(newPassword) {
 					log.Infof("SETPASS: New password too weak for user '%s'", client.accountName)
 					send(conn, ":%s %s :New password does not meet security requirements (minimum 8 characters, maximum 72 characters)\n",
-						config.Values.Server.Host, ErrWeakPassword)
+						s.getConfig().Server.Host, ErrWeakPassword)
 					continue
 				}
 
@@ -2244,7 +2399,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					if err != nil {
 						log.Errorf("SETPASS: Failed to get user data for '%s': %v", client.accountName, err)
 						send(conn, ":%s %s :Password change failed - please try again later\n",
-							config.Values.Server.Host, ErrNoSuchService)
+							s.getConfig().Server.Host, ErrNoSuchService)
 						continue
 					}
 
@@ -2252,7 +2407,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					if err := VerifyPassword(userData.HashedPassword, oldPassword); err != nil {
 						log.Warnf("SETPASS: Old password verification failed for '%s'", client.accountName)
 						send(conn, ":%s %s :Old password incorrect\n",
-							config.Values.Server.Host, ErrPasswdMismatch)
+							s.getConfig().Server.Host, ErrPasswdMismatch)
 						continue
 					}
 
@@ -2261,7 +2416,7 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					if err != nil {
 						log.Errorf("SETPASS: Failed to hash new password for '%s': %v", client.accountName, err)
 						send(conn, ":%s %s :Password change failed - please try again later\n",
-							config.Values.Server.Host, ErrNoSuchService)
+							s.getConfig().Server.Host, ErrNoSuchService)
 						continue
 					}
 
@@ -2269,19 +2424,19 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 					if err := s.RedisClient.UpdatePassword(ctx, client.accountName, newHashedPassword); err != nil {
 						log.Errorf("SETPASS: Failed to update password for '%s': %v", client.accountName, err)
 						send(conn, ":%s %s :Password change failed - please try again later\n",
-							config.Values.Server.Host, ErrNoSuchService)
+							s.getConfig().Server.Host, ErrNoSuchService)
 						continue
 					}
 
 					log.Infof("SETPASS: Successfully changed password for '%s'", client.accountName)
 					send(conn, ":%s NOTICE %s :Password changed successfully\n",
-						config.Values.Server.Host, client.nick)
+						s.getConfig().Server.Host, client.nick)
 				} else {
 					log.Warn("SETPASS: Redis not available")
 					send(conn, ":%s %s :Account service not available\n",
-						config.Values.Server.Host, ErrNoSuchService)
+						s.getConfig().Server.Host, ErrNoSuchService)
 				}
-			} else if cmd == WhoAccCmd && initCompleted {
+			} else if cmd == WhoAccCmd && client.registered {
 				// Command: WHOACC
 				// Display current account information
 				log.Infof("Processing WHOACC command for '%s'", client.nick)
@@ -2293,27 +2448,27 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						if err != nil {
 							log.Errorf("WHOACC: Failed to get user data for '%s': %v", client.accountName, err)
 							send(conn, ":%s NOTICE %s :Account: %s (error retrieving details)\n",
-								config.Values.Server.Host, client.nick, client.accountName)
+								s.getConfig().Server.Host, client.nick, client.accountName)
 						} else {
 							send(conn, ":%s NOTICE %s :Account: %s\n",
-								config.Values.Server.Host, client.nick, userData.Username)
+								s.getConfig().Server.Host, client.nick, userData.Username)
 							send(conn, ":%s NOTICE %s :Email: %s\n",
-								config.Values.Server.Host, client.nick, userData.Email)
+								s.getConfig().Server.Host, client.nick, userData.Email)
 							send(conn, ":%s NOTICE %s :Created: %s\n",
-								config.Values.Server.Host, client.nick, userData.CreatedAt.Format("2006-01-02 15:04:05"))
+								s.getConfig().Server.Host, client.nick, userData.CreatedAt.Format("2006-01-02 15:04:05"))
 							if !userData.LastLogin.IsZero() {
 								send(conn, ":%s NOTICE %s :Last Login: %s\n",
-									config.Values.Server.Host, client.nick, userData.LastLogin.Format("2006-01-02 15:04:05"))
+									s.getConfig().Server.Host, client.nick, userData.LastLogin.Format("2006-01-02 15:04:05"))
 							}
 							log.Infof("WHOACC: Displayed account info for '%s'", client.accountName)
 						}
 					} else {
 						send(conn, ":%s NOTICE %s :Account: %s (authenticated)\n",
-							config.Values.Server.Host, client.nick, client.accountName)
+							s.getConfig().Server.Host, client.nick, client.accountName)
 					}
 				} else {
 					send(conn, ":%s NOTICE %s :You are not logged in to any account\n",
-						config.Values.Server.Host, client.nick)
+						s.getConfig().Server.Host, client.nick)
 					log.Infof("WHOACC: User '%s' not authenticated", client.nick)
 				}
 			}
@@ -2335,22 +2490,43 @@ func (s *Server) AddClient(client Client) error {
 			UUID:     client.identifier.String(),
 			Nick:     client.nick,
 			User:     client.user,
-			Host:     config.Values.Server.Host,
+			Host:     s.getConfig().Server.Host,
 			Channels: []string{}, // Will be updated when joining channels
 		}
 		if err := s.RedisClient.RegisterClient(ctx, clientData); err != nil {
 			log.Errorf("Failed to register client in Redis: %v", err)
 			// Continue anyway - client is registered locally
 		} else {
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 		log.Debugf("Registered client %s in Redis", client.nick)
 	}
 		}
 	}
 
-	send(client.conn, ":%s %s %s :Welcome to the Internet Relay Network %s!%s@%s\n", config.Values.Server.Host, RplWelcome, client.nick, client.nick, client.user, config.Values.Server.Host)
-	send(client.conn, ":%s %s %s :Your host is %s, running version %s\n", config.Values.Server.Host, RplYourHost, client.nick, config.Values.Server.Host, version.GetVersion())
-	send(client.conn, ":%s %s %s :This server was created %s\n", config.Values.Server.Host, RplCreated, client.nick, time.Now().String())
+	send(client.conn, ":%s %s %s :Welcome to the Internet Relay Network %s!%s@%s\n", s.getConfig().Server.Host, RplWelcome, client.nick, client.nick, client.user, s.getConfig().Server.Host)
+	send(client.conn, ":%s %s %s :Your host is %s, running version %s\n", s.getConfig().Server.Host, RplYourHost, client.nick, s.getConfig().Server.Host, version.GetVersion())
+	send(client.conn, ":%s %s %s :This server was created %s\n", s.getConfig().Server.Host, RplCreated, client.nick, time.Now().String())
+
+	// 004 RPL_MYINFO
+	send(client.conn, ":%s %s %s %s %s oiwsz biklmnopstv\n",
+		s.getConfig().Server.Host, RplMyInfo, client.nick,
+		s.getConfig().Server.Host, version.GetVersion())
+
+	// 005 RPL_ISUPPORT (single line, commonly expected by clients)
+	send(client.conn, ":%s %s %s CHANTYPES=# PREFIX=(ov)@+ NETWORK=%s CASEMAPPING=ascii :are supported by this server\n",
+		s.getConfig().Server.Host, RplBounce, client.nick, s.getConfig().Server.Name)
+
+	// MOTD block: 375 / 372* / 376
+	serverName := s.getConfig().Server.Host
+	send(client.conn, ":%s %s %s :- %s Message of the day -\n", serverName, RplMotdStart, client.nick, serverName)
+	motd := s.getConfig().Server.Motd
+	if motd == "" {
+		motd = "Welcome to girc"
+	}
+	for _, line := range strings.Split(motd, "\n") {
+		send(client.conn, ":%s %s %s :- %s\n", serverName, RplMotd, client.nick, line)
+	}
+	send(client.conn, ":%s %s %s :End of MOTD command\n", serverName, RplEndOfMotd, client.nick)
 
 	return s.JoinRoomByName(client, s.Lobby.name)
 }
@@ -2445,7 +2621,7 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 			log.Errorf("Failed to join channel in Redis: %v", err)
 			// Continue anyway - channel is joined locally
 		} else {
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 		log.Debugf("Client %s joined channel %s in Redis", clientPtr.nick, channelName)
 	}
 		}
@@ -2479,23 +2655,25 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 	for _, ident := range clientIDs {
 		for _, cli := range s.Clients {
 			if ident == cli.identifier {
-				send(cli.conn, ":%s!%s@%s %s #%s\n", clientPtr.nick, clientPtr.user, config.Values.Server.Host, JoinCmd, roomPtr.name)
+				send(cli.conn, ":%s!%s@%s %s #%s\n", clientPtr.nick, clientPtr.user, s.getConfig().Server.Host, JoinCmd, roomPtr.name)
 				names = append(names, cli.nick)
 			}
 		}
 	}
 
 	if roomPtr.topic == "" {
-		send(clientPtr.conn, ":%s %s %s #%s :No topic is set\n", config.Values.Server.Host, RplTopic, clientPtr.nick, roomPtr.name)
+		// 331 RPL_NOTOPIC
+		send(clientPtr.conn, ":%s %s %s #%s :No topic is set\n", s.getConfig().Server.Host, RplNoTopic, clientPtr.nick, roomPtr.name)
 	} else {
-		send(clientPtr.conn, ":%s %s %s #%s :%s\n", config.Values.Server.Host, RplNoTopic, clientPtr.nick, roomPtr.name, roomPtr.topic)
+		// 332 RPL_TOPIC
+		send(clientPtr.conn, ":%s %s %s #%s :%s\n", s.getConfig().Server.Host, RplTopic, clientPtr.nick, roomPtr.name, roomPtr.topic)
 	}
 
 	// send list of all clients in room to user
 	// "( "=" / "*" / "@" ) <channel> :[ "@" / "+" ] <nick> *( " " [ "@" / "+" ] <nick> )
-	send(clientPtr.conn, ":%s %s %s = #%s :%s\n", config.Values.Server.Host, RplNameReply, clientPtr.nick, roomPtr.name, strings.Join(names[:], " "))
+	send(clientPtr.conn, ":%s %s %s = #%s :%s\n", s.getConfig().Server.Host, RplNameReply, clientPtr.nick, roomPtr.name, strings.Join(names[:], " "))
 
-	send(clientPtr.conn, ":%s %s %s #%s :End of NAMES list\n", config.Values.Server.Host, RplEndOfNames, clientPtr.nick, roomPtr.name)
+	send(clientPtr.conn, ":%s %s %s #%s :End of NAMES list\n", s.getConfig().Server.Host, RplEndOfNames, clientPtr.nick, roomPtr.name)
 	return nil
 }
 
@@ -2507,7 +2685,7 @@ func (s *Server) RemoveClient(id uuid.UUID) {
 			log.Errorf("Failed to unregister client from Redis: %v", err)
 			// Continue anyway - will remove from local state
 		} else {
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 		log.Debugf("Unregistered client %s from Redis", id.String())
 	}
 		}
@@ -2516,28 +2694,17 @@ func (s *Server) RemoveClient(id uuid.UUID) {
 	s.ClientsMutex.Lock()
 	defer s.ClientsMutex.Unlock()
 
-	if len(s.Clients) < 2 {
-		s.Clients = []Client{}
-		return
-	}
-
-	var index int
+	index := -1
 	for num, iter := range s.Clients {
 		if iter.identifier == id {
 			index = num
 			break
 		}
 	}
-	if len(s.Clients) == 2 {
-		if index == 0 {
-			s.Clients = s.Clients[index+1:]
-		} else {
-			s.Clients = s.Clients[:index]
-		}
-	} else {
-		s.Clients = append(s.Clients[:index], s.Clients[index+1:]...)
+	if index == -1 {
+		return // not found; nothing to do
 	}
-	return
+	s.Clients = append(s.Clients[:index], s.Clients[index+1:]...)
 }
 
 func (s *Server) IsUserInRoom(client Client, roomName string) (bool, *Room) {
@@ -2548,10 +2715,10 @@ func (s *Server) IsUserInRoom(client Client, roomName string) (bool, *Room) {
 	s.RoomsMutex.Lock()
 	defer s.RoomsMutex.Unlock()
 
-	for _, room := range s.Rooms {
-		if strings.Compare(room.name, compareRoomName) == 0 {
-			if _, ok := client.rooms[room.identifier]; ok {
-				return true, &room
+	for i := range s.Rooms {
+		if strings.Compare(s.Rooms[i].name, compareRoomName) == 0 {
+			if _, ok := client.rooms[s.Rooms[i].identifier]; ok {
+				return true, &s.Rooms[i]
 			}
 		}
 	}
@@ -2605,7 +2772,7 @@ func (s *Server) UpdateClientNick(clientID uuid.UUID, newNick string) {
 }
 
 func createRoom(name string) Room {
-	return Room{
+	r := Room{
 		roomMux:    &sync.Mutex{},
 		identifier: uuid.Must(uuid.NewRandom()),
 		name:       name,
@@ -2615,15 +2782,45 @@ func createRoom(name string) Room {
 		voiced:     make(map[uuid.UUID]bool),
 		founders:   make(map[uuid.UUID]bool),
 		registered: false,
-		topicLock:  true,  // Default: only ops can set topic
-		noExternal: true,  // Default: no external messages
+	}
+	// Apply default channel modes from config (e.g. "+nt").
+	modes := "+nt"
+	if config.Values != nil && config.Values.Server.DefaultChannelModes != "" {
+		modes = config.Values.Server.DefaultChannelModes
+	}
+	applyModeString(&r, modes)
+	return r
+}
+
+// applyModeString applies a mode string like "+nt" to a room.
+func applyModeString(r *Room, modes string) {
+	adding := true
+	for _, ch := range modes {
+		switch ch {
+		case '+':
+			adding = true
+		case '-':
+			adding = false
+		case 't':
+			r.topicLock = adding
+		case 'n':
+			r.noExternal = adding
+		case 'm':
+			r.moderated = adding
+		case 'i':
+			r.inviteOnly = adding
+		case 's':
+			r.secret = adding
+		case 'p':
+			r.private = adding
+		}
 	}
 }
 
 func validNickCharset(test string) bool {
 	re, err := regexp.Compile("^[-#&*_a-zA-Z0-9]{1,}$")
 	if err != nil {
-		fmt.Printf("Something went wrong validating the nickname\n")
+		log.Errorf("Something went wrong validating the nickname")
 		return false
 	}
 	if !re.MatchString(test) {
@@ -2638,7 +2835,11 @@ func validMessageMask(mask string) bool {
 
 func send(conn net.Conn, format string, a ...interface{}) {
 	message := fmt.Sprintf(format, a...)
-	fmt.Printf(">> %s", message)
+	// Normalise line endings: strip any trailing \n, always append \r\n.
+	message = strings.TrimRight(message, "\n")
+	message = strings.TrimRight(message, "\r")
+	message += "\r\n"
+	log.Debugf(">> %s", strings.TrimRight(message, "\r\n"))
 	conn.Write([]byte(message))
 }
 
@@ -2653,6 +2854,43 @@ func send(conn net.Conn, format string, a ...interface{}) {
 // 	// }
 // 	return ""
 // }
+
+// pingClient sends a PING to the given connection every PingInterval.
+// It closes the connection if no PONG is received within 2*PingInterval.
+// The goroutine exits when the connection is closed.
+func (s *Server) pingClient(conn net.Conn, clientID uuid.UUID) {
+	if s.PingInterval == 0 {
+		return
+	}
+	ticker := time.NewTicker(s.PingInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Check if client is still registered.
+		s.ClientsMutex.Lock()
+		found := false
+		for _, c := range s.Clients {
+			if c.identifier == clientID {
+				found = true
+				break
+			}
+		}
+		s.ClientsMutex.Unlock()
+		if !found {
+			return
+		}
+
+		pingMsg := fmt.Sprintf("PING :%s\r\n", s.getConfig().Server.Host)
+		conn.SetWriteDeadline(time.Now().Add(s.PingInterval))
+		if _, err := conn.Write([]byte(pingMsg)); err != nil {
+			return
+		}
+
+		// Set read deadline to 2*PingInterval so the main read loop times out
+		// if no PONG arrives.
+		conn.SetReadDeadline(time.Now().Add(2 * s.PingInterval))
+	}
+}
 
 // startHeartbeat sends periodic heartbeats to Redis to signal this pod is alive
 func (s *Server) startHeartbeat() {
@@ -2679,7 +2917,7 @@ func (s *Server) startHeartbeat() {
 			if err := s.RedisClient.Heartbeat(ctx, clientCount, version.GetVersion()); err != nil {
 				log.Errorf("Failed to send heartbeat: %v", err)
 			} else {
-				if config.Values.Server.Debug {
+				if s.getConfig().Server.Debug {
 		log.Debugf("Heartbeat sent (clients: %d)", clientCount)
 	}
 			}
@@ -2716,7 +2954,7 @@ func (s *Server) startOrphanCleanup() {
 			}
 
 			if isLeader {
-				if config.Values.Server.Debug {
+				if s.getConfig().Server.Debug {
 		log.Debugf("This pod is the leader, performing cleanup...")
 	}
 				// We are the leader, perform cleanup
@@ -2726,7 +2964,7 @@ func (s *Server) startOrphanCleanup() {
 				} else if count > 0 {
 					log.Infof("Cleaned up %d orphaned clients", count)
 				} else {
-					if config.Values.Server.Debug {
+					if s.getConfig().Server.Debug {
 		log.Debugf("No orphaned clients found")
 	}
 				}
@@ -2736,7 +2974,7 @@ func (s *Server) startOrphanCleanup() {
 					log.Errorf("Failed to release leader lock: %v", err)
 				}
 			} else {
-				if config.Values.Server.Debug {
+				if s.getConfig().Server.Debug {
 		log.Debugf("Another pod is the leader, skipping cleanup")
 	}
 			}
@@ -2761,7 +2999,7 @@ func (s *Server) subscribeToRedisEvents() {
 	log.Println("Subscribed to Redis events, listening for cross-pod messages...")
 
 	for event := range eventChan {
-		if config.Values.Server.Debug {
+		if s.getConfig().Server.Debug {
 		log.Debugf("Received Redis event: %s", event.Type)
 	}
 
@@ -2779,7 +3017,7 @@ func (s *Server) subscribeToRedisEvents() {
 		case "KICK":
 			s.handleRedisKick(event)
 		default:
-			if config.Values.Server.Debug {
+			if s.getConfig().Server.Debug {
 		log.Debugf("Unknown Redis event type: %s", event.Type)
 	}
 		}
@@ -2791,42 +3029,42 @@ func (s *Server) subscribeToRedisEvents() {
 // Redis event handlers (stubs for now, will implement in following commits)
 func (s *Server) handleRedisPrivmsg(event *redis.Event) {
 	// TODO: Implement PRIVMSG event handler
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("Handling PRIVMSG event: %+v", event.Data)
 	}
 }
 
 func (s *Server) handleRedisJoin(event *redis.Event) {
 	// TODO: Implement JOIN event handler
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("Handling JOIN event: %+v", event.Data)
 	}
 }
 
 func (s *Server) handleRedisPart(event *redis.Event) {
 	// TODO: Implement PART event handler
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("Handling PART event: %+v", event.Data)
 	}
 }
 
 func (s *Server) handleRedisQuit(event *redis.Event) {
 	// TODO: Implement QUIT event handler
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("Handling QUIT event: %+v", event.Data)
 	}
 }
 
 func (s *Server) handleRedisNick(event *redis.Event) {
 	// TODO: Implement NICK event handler
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("Handling NICK event: %+v", event.Data)
 	}
 }
 
 func (s *Server) handleRedisKick(event *redis.Event) {
 	// TODO: Implement KICK event handler
-	if config.Values.Server.Debug {
+	if s.getConfig().Server.Debug {
 		log.Debugf("Handling KICK event: %+v", event.Data)
 	}
 }
