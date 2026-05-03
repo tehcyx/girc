@@ -370,7 +370,6 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 				// ERR_TOOMANYTARGETS
 			} else {
 				if inChannel, room := s.IsUserInRoom(*client, target); inChannel {
-					// Snapshot member IDs under roomMux, then send under ClientsMutex.
 					room.roomMux.Lock()
 					memberIDs := make([]uuid.UUID, 0, len(room.clients))
 					for ident := range room.clients {
@@ -684,27 +683,20 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 			return true
 		}
 
-		// Check if target is in the channel
-		targetInChannel := false
+		// Check membership, snapshot IDs, and remove target — all under one lock.
 		room.roomMux.Lock()
 		if room.clients != nil {
-			_, targetInChannel = room.clients[targetClient.identifier]
+			if _, inChan := room.clients[targetClient.identifier]; !inChan {
+				room.roomMux.Unlock()
+				send(conn, ":%s %s %s %s :They aren't on that channel\n",
+					s.getConfig().Server.Host, ErrUserNotInChannel, targetNick, channelName)
+				return true
+			}
 		}
-		room.roomMux.Unlock()
-
-		if !targetInChannel {
-			send(conn, ":%s %s %s %s :They aren't on that channel\n",
-				s.getConfig().Server.Host, ErrUserNotInChannel, targetNick, channelName)
-			return true
-		}
-
-		// Snapshot member IDs under roomMux, then send under ClientsMutex.
-		room.roomMux.Lock()
 		kickMemberIDs := make([]uuid.UUID, 0, len(room.clients))
 		for memberID := range room.clients {
 			kickMemberIDs = append(kickMemberIDs, memberID)
 		}
-		// Remove target from channel while still holding roomMux.
 		delete(room.clients, targetClient.identifier)
 		if room.operators != nil {
 			delete(room.operators, targetClient.identifier)
