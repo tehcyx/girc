@@ -10,12 +10,41 @@ import (
 
 // TestChannelModesSurviveRestart verifies that channel modes set before a
 // server restart are restored from Redis after hydration.
-//
-// NOTE: This test is currently skipped because hydrateChannelsFromRedis
-// does not restore channel modes from Redis (only topic and registered flag
-// are hydrated). This is a known limitation / code-writer feedback item.
 func TestChannelModesSurviveRestart(t *testing.T) {
-	t.Skip("known limitation: hydrateChannelsFromRedis does not restore channel modes (only topic+registered); fix needed in server.go hydrateChannelsFromRedis")
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	addr1, makeServer := startPersistenceServer(t, mr)
+
+	// Phase 1: connect, join a channel, set mode +m.
+	c1 := dialServer(t, addr1)
+	register(t, c1, "modeA")
+
+	c1.send(t, "JOIN #modepersist")
+	c1.readUntil(t, func(l string) bool { return strings.Contains(l, "JOIN") && strings.Contains(l, "modepersist") })
+
+	c1.send(t, "MODE #modepersist +m")
+	c1.readUntil(t, func(l string) bool { return strings.Contains(l, "MODE") && strings.Contains(l, "modepersist") })
+
+	// Phase 2: restart (new server instance reading from same Redis).
+	addr2 := makeServer()
+	time.Sleep(50 * time.Millisecond)
+
+	// Phase 3: connect to new instance and query the channel modes.
+	c2 := dialServer(t, addr2)
+	register(t, c2, "modeB")
+
+	c2.send(t, "MODE #modepersist")
+
+	line := c2.readUntil(t, func(l string) bool {
+		return strings.Contains(l, "324") || (strings.Contains(l, "MODE") && strings.Contains(l, "modepersist"))
+	})
+	if !strings.Contains(line, "m") {
+		t.Errorf("expected mode +m to survive restart, got: %s", line)
+	}
 }
 
 // TestMemberListDoesNotSurviveRestart verifies that channel members are NOT

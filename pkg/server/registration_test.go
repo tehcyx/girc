@@ -24,13 +24,7 @@ func TestRegistrationNICKThenUSER(t *testing.T) {
 
 // TestRegistrationUSERThenNICK sends USER before NICK.
 // The server stores user params and completes registration when NICK arrives.
-//
-// NOTE: This test is currently skipped because the server does not implement
-// the USER-first path: when NICK arrives after USER the NICK handler only
-// sets the nick field but never calls AddClient, so 001 is never sent.
-// This is a known code-writer feedback item.
 func TestRegistrationUSERThenNICK(t *testing.T) {
-	t.Skip("known limitation: server does not complete registration when USER arrives before NICK; fix needed in handlers.go NICK handler")
 	addr := startTestServer(t)
 	c := dialServer(t, addr)
 

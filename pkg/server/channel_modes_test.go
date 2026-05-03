@@ -1,25 +1,31 @@
 package server
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/tehcyx/girc/internal/config"
 )
 
+// newServerWithCfg returns a minimal server with the given config for unit tests.
+func newServerWithCfg(cfg *config.Config) *Server {
+	return &Server{
+		Clients:      []Client{},
+		ClientsMutex: &sync.Mutex{},
+		Rooms:        []Room{},
+		RoomsMutex:   &sync.Mutex{},
+		cfg:          cfg,
+	}
+}
+
 // TestDefaultChannelModesApplied verifies that createRoom applies the
-// DefaultChannelModes from config.Values to the new room.
-//
-// NOTE: createRoom reads from config.Values (global) rather than the server's
-// s.cfg. This is a known code-writer feedback item: createRoom should accept
-// a config parameter or read from s.cfg so tests don't need to touch globals.
+// DefaultChannelModes from s.cfg to the new room.
 func TestDefaultChannelModesApplied(t *testing.T) {
-	prev := config.Values
-	defer func() { config.Values = prev }()
 	cfg := &config.Config{}
 	cfg.Server.DefaultChannelModes = "+m"
-	config.Values = cfg
+	s := newServerWithCfg(cfg)
 
-	room := createRoom("testmodechan")
+	room := s.createRoom("testmodechan")
 
 	if !room.moderated {
 		t.Error("expected room.moderated=true for default mode '+m', got false")
@@ -35,13 +41,11 @@ func TestDefaultChannelModesApplied(t *testing.T) {
 // TestDefaultChannelModesNT verifies that the standard default "+nt" sets
 // topicLock and noExternal on newly created rooms.
 func TestDefaultChannelModesNT(t *testing.T) {
-	prev := config.Values
-	defer func() { config.Values = prev }()
 	cfg := &config.Config{}
 	cfg.Server.DefaultChannelModes = "+nt"
-	config.Values = cfg
+	s := newServerWithCfg(cfg)
 
-	room := createRoom("testntchan")
+	room := s.createRoom("testntchan")
 
 	if !room.topicLock {
 		t.Error("expected room.topicLock=true for '+nt'")
@@ -51,14 +55,16 @@ func TestDefaultChannelModesNT(t *testing.T) {
 	}
 }
 
-// TestDefaultChannelModesFallback verifies that when config.Values is nil
-// createRoom falls back to the hardcoded "+nt" default.
+// TestDefaultChannelModesFallback verifies that when s.cfg is nil
+// createRoom falls back to the global config.Values, and when that is nil
+// falls back to the hardcoded "+nt" default.
 func TestDefaultChannelModesFallback(t *testing.T) {
 	prev := config.Values
 	defer func() { config.Values = prev }()
 	config.Values = nil
 
-	room := createRoom("testfallbackchan")
+	s := newServerWithCfg(nil)
+	room := s.createRoom("testfallbackchan")
 
 	// Hardcoded fallback is "+nt".
 	if !room.topicLock {
