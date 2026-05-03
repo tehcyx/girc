@@ -419,6 +419,11 @@ func (c *Client) Health(ctx context.Context) error {
 	return c.rdb.Ping(ctx).Err()
 }
 
+// PodID returns this client's pod identifier.
+func (c *Client) PodID() string {
+	return c.podID
+}
+
 // GracefulShutdown handles graceful pod shutdown by disconnecting clients
 // without deleting their state. This allows clients to reconnect to other pods.
 // The actual cleanup of stale client data should be handled by:

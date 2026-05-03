@@ -515,6 +515,8 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 								"uuid":     client.identifier.String(),
 								"old_nick": oldNick,
 								"new_nick": newNick,
+								"user":     client.user,
+								"pod_id":   s.RedisClient.PodID(),
 							},
 						}
 						if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
@@ -701,6 +703,24 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 								}
 							}
 							room.roomMux.Unlock()
+
+							// Publish to Redis for cross-pod delivery.
+							if s.RedisClient != nil {
+								ctx := context.Background()
+								event := redis.Event{
+									Type: "PRIVMSG",
+									Data: map[string]interface{}{
+										"from_nick": client.nick,
+										"from_user": client.user,
+										"target":    target,
+										"message":   chatMessage,
+										"pod_id":    s.RedisClient.PodID(),
+									},
+								}
+								if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
+									log.Errorf("[PRIVMSG] Failed to publish to Redis: %v", err)
+								}
+							}
 						} else {
 							send(conn, ":%s %s %s %s :Cannot send to channel\n", s.getConfig().Server.Host, ErrCannotSendToChan, client.nick, target)
 						}
@@ -712,6 +732,24 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 						send(conn, ":%s %s %s %s :No such nick/channel\n", s.getConfig().Server.Host, ErrNoSuchNick, client.nick, target)
 					} else {
 						send(targetClient.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, s.getConfig().Server.Host, PrivmsgCmd, target, chatMessage)
+
+						// Publish to Redis for cross-pod direct message delivery.
+						if s.RedisClient != nil {
+							ctx := context.Background()
+							event := redis.Event{
+								Type: "PRIVMSG",
+								Data: map[string]interface{}{
+									"from_nick": client.nick,
+									"from_user": client.user,
+									"target":    target,
+									"message":   chatMessage,
+									"pod_id":    s.RedisClient.PodID(),
+								},
+							}
+							if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
+								log.Errorf("[PRIVMSG] Failed to publish to Redis: %v", err)
+							}
+						}
 					}
 				}
 			} else if cmd == PartCmd && client.registered {
@@ -793,8 +831,10 @@ func (s *Server) handleClientConnect(conn net.Conn) {
 							Data: map[string]interface{}{
 								"uuid":    client.identifier.String(),
 								"nick":    client.nick,
+								"user":    client.user,
 								"channel": channelName,
 								"message": partMessage,
+								"pod_id":  s.RedisClient.PodID(),
 							},
 						}
 						if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
@@ -2634,6 +2674,7 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 				"nick":    clientPtr.nick,
 				"user":    clientPtr.user,
 				"channel": channelName,
+				"pod_id":  s.RedisClient.PodID(),
 			},
 		}
 		if err := s.RedisClient.PublishEvent(ctx, event); err != nil {
@@ -3026,45 +3067,291 @@ func (s *Server) subscribeToRedisEvents() {
 	log.Println("Redis event subscription ended")
 }
 
-// Redis event handlers (stubs for now, will implement in following commits)
+// redisStr extracts a string value from an event data map.
+func redisStr(data map[string]interface{}, key string) string {
+	if v, ok := data[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// handleRedisPrivmsg handles a PRIVMSG event received from another pod.
+// It delivers the message to local clients that are in the target channel/user.
+// The event data contains: from_nick, from_user, target, message, pod_id.
+// We skip events that originated from this pod to prevent loops.
 func (s *Server) handleRedisPrivmsg(event *redis.Event) {
-	// TODO: Implement PRIVMSG event handler
-	if s.getConfig().Server.Debug {
-		log.Debugf("Handling PRIVMSG event: %+v", event.Data)
+	fromNick := redisStr(event.Data, "from_nick")
+	fromUser := redisStr(event.Data, "from_user")
+	target := redisStr(event.Data, "target")
+	message := redisStr(event.Data, "message")
+	originPod := redisStr(event.Data, "pod_id")
+
+	if originPod == s.RedisClient.PodID() {
+		return // skip events we published
+	}
+
+	if fromNick == "" || target == "" {
+		return
+	}
+
+	cfg := s.getConfig()
+	privmsgLine := fmt.Sprintf(":%s!%s@%s PRIVMSG %s :%s\r\n",
+		fromNick, fromUser, cfg.Server.Host, target, message)
+
+	if strings.HasPrefix(target, "#") {
+		// Channel message: deliver to all local clients in this channel.
+		channelName := target[1:]
+		s.RoomsMutex.Lock()
+		var room *Room
+		for i := range s.Rooms {
+			if s.Rooms[i].name == channelName {
+				room = &s.Rooms[i]
+				break
+			}
+		}
+		s.RoomsMutex.Unlock()
+		if room == nil {
+			return
+		}
+		room.roomMux.Lock()
+		memberIDs := make([]uuid.UUID, 0, len(room.clients))
+		for id := range room.clients {
+			memberIDs = append(memberIDs, id)
+		}
+		room.roomMux.Unlock()
+
+		s.ClientsMutex.Lock()
+		for _, id := range memberIDs {
+			for i := range s.Clients {
+				if s.Clients[i].identifier == id && s.Clients[i].conn != nil {
+					s.Clients[i].conn.Write([]byte(privmsgLine))
+					break
+				}
+			}
+		}
+		s.ClientsMutex.Unlock()
+	} else {
+		// Direct message to a specific nick on this pod.
+		s.ClientsMutex.Lock()
+		for i := range s.Clients {
+			if strings.EqualFold(s.Clients[i].nick, target) && s.Clients[i].conn != nil {
+				s.Clients[i].conn.Write([]byte(privmsgLine))
+				break
+			}
+		}
+		s.ClientsMutex.Unlock()
 	}
 }
 
+// handleRedisJoin handles a JOIN event from another pod.
+// It updates local room state so our clients see the remote client in the channel.
+// Event data: uuid, nick, user, channel, pod_id.
 func (s *Server) handleRedisJoin(event *redis.Event) {
-	// TODO: Implement JOIN event handler
-	if s.getConfig().Server.Debug {
-		log.Debugf("Handling JOIN event: %+v", event.Data)
+	originPod := redisStr(event.Data, "pod_id")
+	if originPod == s.RedisClient.PodID() {
+		return
 	}
+	remoteNick := redisStr(event.Data, "nick")
+	remoteUser := redisStr(event.Data, "user")
+	channel := redisStr(event.Data, "channel")
+	if remoteNick == "" || channel == "" {
+		return
+	}
+
+	channelName := strings.TrimPrefix(channel, "#")
+	cfg := s.getConfig()
+	joinLine := fmt.Sprintf(":%s!%s@%s JOIN %s\r\n", remoteNick, remoteUser, cfg.Server.Host, channel)
+
+	// Notify all local clients in that channel.
+	s.RoomsMutex.Lock()
+	var room *Room
+	for i := range s.Rooms {
+		if s.Rooms[i].name == channelName {
+			room = &s.Rooms[i]
+			break
+		}
+	}
+	s.RoomsMutex.Unlock()
+	if room == nil {
+		return
+	}
+
+	room.roomMux.Lock()
+	memberIDs := make([]uuid.UUID, 0, len(room.clients))
+	for id := range room.clients {
+		memberIDs = append(memberIDs, id)
+	}
+	room.roomMux.Unlock()
+
+	s.ClientsMutex.Lock()
+	for _, id := range memberIDs {
+		for i := range s.Clients {
+			if s.Clients[i].identifier == id && s.Clients[i].conn != nil {
+				s.Clients[i].conn.Write([]byte(joinLine))
+				break
+			}
+		}
+	}
+	s.ClientsMutex.Unlock()
 }
 
+// handleRedisPart handles a PART event from another pod.
+// Event data: uuid, nick, user, channel, message, pod_id.
 func (s *Server) handleRedisPart(event *redis.Event) {
-	// TODO: Implement PART event handler
-	if s.getConfig().Server.Debug {
-		log.Debugf("Handling PART event: %+v", event.Data)
+	originPod := redisStr(event.Data, "pod_id")
+	if originPod == s.RedisClient.PodID() {
+		return
 	}
+	remoteNick := redisStr(event.Data, "nick")
+	remoteUser := redisStr(event.Data, "user")
+	channel := redisStr(event.Data, "channel")
+	message := redisStr(event.Data, "message")
+	if remoteNick == "" || channel == "" {
+		return
+	}
+
+	channelName := strings.TrimPrefix(channel, "#")
+	cfg := s.getConfig()
+	partLine := fmt.Sprintf(":%s!%s@%s PART %s :%s\r\n", remoteNick, remoteUser, cfg.Server.Host, channel, message)
+
+	s.RoomsMutex.Lock()
+	var room *Room
+	for i := range s.Rooms {
+		if s.Rooms[i].name == channelName {
+			room = &s.Rooms[i]
+			break
+		}
+	}
+	s.RoomsMutex.Unlock()
+	if room == nil {
+		return
+	}
+
+	room.roomMux.Lock()
+	memberIDs := make([]uuid.UUID, 0, len(room.clients))
+	for id := range room.clients {
+		memberIDs = append(memberIDs, id)
+	}
+	room.roomMux.Unlock()
+
+	s.ClientsMutex.Lock()
+	for _, id := range memberIDs {
+		for i := range s.Clients {
+			if s.Clients[i].identifier == id && s.Clients[i].conn != nil {
+				s.Clients[i].conn.Write([]byte(partLine))
+				break
+			}
+		}
+	}
+	s.ClientsMutex.Unlock()
 }
 
+// handleRedisQuit handles a QUIT event from another pod.
+// Event data: uuid, nick, user, reason, pod_id.
 func (s *Server) handleRedisQuit(event *redis.Event) {
-	// TODO: Implement QUIT event handler
-	if s.getConfig().Server.Debug {
-		log.Debugf("Handling QUIT event: %+v", event.Data)
+	originPod := redisStr(event.Data, "pod_id")
+	if originPod == s.RedisClient.PodID() {
+		return
 	}
+	remoteNick := redisStr(event.Data, "nick")
+	remoteUser := redisStr(event.Data, "user")
+	reason := redisStr(event.Data, "reason")
+	if remoteNick == "" {
+		return
+	}
+
+	cfg := s.getConfig()
+	quitLine := fmt.Sprintf(":%s!%s@%s QUIT :%s\r\n", remoteNick, remoteUser, cfg.Server.Host, reason)
+
+	// Send QUIT to all local clients that share a channel with the remote client.
+	// We broadcast to everyone for simplicity since we don't track remote clients locally.
+	s.ClientsMutex.Lock()
+	for i := range s.Clients {
+		if s.Clients[i].conn != nil {
+			s.Clients[i].conn.Write([]byte(quitLine))
+		}
+	}
+	s.ClientsMutex.Unlock()
 }
 
+// handleRedisNick handles a NICK change event from another pod.
+// Event data: uuid, old_nick, new_nick, user, pod_id.
 func (s *Server) handleRedisNick(event *redis.Event) {
-	// TODO: Implement NICK event handler
-	if s.getConfig().Server.Debug {
-		log.Debugf("Handling NICK event: %+v", event.Data)
+	originPod := redisStr(event.Data, "pod_id")
+	if originPod == s.RedisClient.PodID() {
+		return
 	}
+	oldNick := redisStr(event.Data, "old_nick")
+	newNick := redisStr(event.Data, "new_nick")
+	user := redisStr(event.Data, "user")
+	if oldNick == "" || newNick == "" {
+		return
+	}
+
+	cfg := s.getConfig()
+	nickLine := fmt.Sprintf(":%s!%s@%s NICK :%s\r\n", oldNick, user, cfg.Server.Host, newNick)
+
+	// Notify all local clients.
+	s.ClientsMutex.Lock()
+	for i := range s.Clients {
+		if s.Clients[i].conn != nil {
+			s.Clients[i].conn.Write([]byte(nickLine))
+		}
+	}
+	s.ClientsMutex.Unlock()
 }
 
+// handleRedisKick handles a KICK event from another pod.
+// Event data: from_nick, from_user, target_nick, channel, reason, pod_id.
 func (s *Server) handleRedisKick(event *redis.Event) {
-	// TODO: Implement KICK event handler
-	if s.getConfig().Server.Debug {
-		log.Debugf("Handling KICK event: %+v", event.Data)
+	originPod := redisStr(event.Data, "pod_id")
+	if originPod == s.RedisClient.PodID() {
+		return
 	}
+	fromNick := redisStr(event.Data, "from_nick")
+	fromUser := redisStr(event.Data, "from_user")
+	targetNick := redisStr(event.Data, "target_nick")
+	channel := redisStr(event.Data, "channel")
+	reason := redisStr(event.Data, "reason")
+	if fromNick == "" || channel == "" || targetNick == "" {
+		return
+	}
+
+	channelName := strings.TrimPrefix(channel, "#")
+	cfg := s.getConfig()
+	kickLine := fmt.Sprintf(":%s!%s@%s KICK %s %s :%s\r\n",
+		fromNick, fromUser, cfg.Server.Host, channel, targetNick, reason)
+
+	s.RoomsMutex.Lock()
+	var room *Room
+	for i := range s.Rooms {
+		if s.Rooms[i].name == channelName {
+			room = &s.Rooms[i]
+			break
+		}
+	}
+	s.RoomsMutex.Unlock()
+	if room == nil {
+		return
+	}
+
+	room.roomMux.Lock()
+	memberIDs := make([]uuid.UUID, 0, len(room.clients))
+	for id := range room.clients {
+		memberIDs = append(memberIDs, id)
+	}
+	room.roomMux.Unlock()
+
+	s.ClientsMutex.Lock()
+	for _, id := range memberIDs {
+		for i := range s.Clients {
+			if s.Clients[i].identifier == id && s.Clients[i].conn != nil {
+				s.Clients[i].conn.Write([]byte(kickLine))
+				break
+			}
+		}
+	}
+	s.ClientsMutex.Unlock()
 }
