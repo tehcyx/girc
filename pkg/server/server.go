@@ -197,11 +197,14 @@ func New() {
 }
 
 func (s *Server) getConfig() *config.Config {
+	if s.cfg == nil {
+		return config.Values
+	}
 	return s.cfg
 }
 
 func (s *Server) initRooms() {
-	lobby := createRoom("lobby")
+	lobby := s.createRoom("lobby")
 
 	s.RoomsMutex.Lock()
 	defer s.RoomsMutex.Unlock()
@@ -471,7 +474,7 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 	}
 	isNewRoom := false
 	if roomPtr == nil {
-		newRoom := createRoom(roomName)
+		newRoom := s.createRoom(roomName)
 		s.Rooms = append(s.Rooms, newRoom)
 		roomPtr = &s.Rooms[len(s.Rooms)-1]
 		isNewRoom = true
@@ -533,14 +536,17 @@ func (s *Server) JoinRoomByName(client Client, roomName string) error {
 	roomPtr.roomMux.Unlock()
 
 	var names []string
+	s.ClientsMutex.Lock()
 	for _, ident := range clientIDs {
-		for _, cli := range s.Clients {
-			if ident == cli.identifier {
-				send(cli.conn, ":%s!%s@%s %s #%s\n", clientPtr.nick, clientPtr.user, s.getConfig().Server.Host, JoinCmd, roomPtr.name)
-				names = append(names, cli.nick)
+		for i := range s.Clients {
+			if ident == s.Clients[i].identifier {
+				send(s.Clients[i].conn, ":%s!%s@%s %s #%s\n", clientPtr.nick, clientPtr.user, s.getConfig().Server.Host, JoinCmd, roomPtr.name)
+				names = append(names, s.Clients[i].nick)
+				break
 			}
 		}
 	}
+	s.ClientsMutex.Unlock()
 
 	if roomPtr.topic == "" {
 		// 331 RPL_NOTOPIC
@@ -652,7 +658,7 @@ func (s *Server) UpdateClientNick(clientID uuid.UUID, newNick string) {
 	}
 }
 
-func createRoom(name string) Room {
+func (s *Server) createRoom(name string) Room {
 	r := Room{
 		roomMux:    &sync.Mutex{},
 		identifier: uuid.Must(uuid.NewRandom()),
@@ -664,13 +670,38 @@ func createRoom(name string) Room {
 		founders:   make(map[uuid.UUID]bool),
 		registered: false,
 	}
-	// Apply default channel modes from config (e.g. "+nt").
+	// Apply default channel modes from server config (e.g. "+nt").
 	modes := "+nt"
-	if config.Values != nil && config.Values.Server.DefaultChannelModes != "" {
-		modes = config.Values.Server.DefaultChannelModes
+	if cfg := s.getConfig(); cfg != nil && cfg.Server.DefaultChannelModes != "" {
+		modes = cfg.Server.DefaultChannelModes
 	}
 	applyModeString(&r, modes)
 	return r
+}
+
+// roomModeString returns a mode string representing the current flags on a room (e.g. "+nt").
+func roomModeString(r *Room) string {
+	var b strings.Builder
+	b.WriteString("+")
+	if r.topicLock {
+		b.WriteString("t")
+	}
+	if r.noExternal {
+		b.WriteString("n")
+	}
+	if r.moderated {
+		b.WriteString("m")
+	}
+	if r.inviteOnly {
+		b.WriteString("i")
+	}
+	if r.secret {
+		b.WriteString("s")
+	}
+	if r.private {
+		b.WriteString("p")
+	}
+	return b.String()
 }
 
 // applyModeString applies a mode string like "+nt" to a room.
@@ -771,15 +802,19 @@ func (s *Server) hydrateChannelsFromRedis(ctx context.Context) error {
 			}
 		}
 		if !exists {
-			room := createRoom(channelName)
+			room := s.createRoom(channelName)
 			if ch.Topic != "" {
 				room.topic = ch.Topic
 			}
 			if ch.Registered {
 				room.registered = true
 			}
+			// Restore persisted modes on top of defaults.
+			if ch.Modes != "" {
+				applyModeString(&room, ch.Modes)
+			}
 			s.Rooms = append(s.Rooms, room)
-			log.Infof("[hydrate] Restored channel #%s from Redis (topic: %q)", channelName, ch.Topic)
+			log.Infof("[hydrate] Restored channel #%s from Redis (topic: %q, modes: %q)", channelName, ch.Topic, ch.Modes)
 		}
 		s.RoomsMutex.Unlock()
 	}
@@ -1140,6 +1175,10 @@ func (s *Server) handleRedisPart(event *redis.Event) {
 
 // handleRedisQuit handles a QUIT event from another pod.
 // Event data: uuid, nick, user, reason, pod_id.
+//
+// Per RFC, QUIT should go only to clients sharing a channel with the quitter.
+// Cross-pod events do not carry the remote client's channel list, so we send
+// to all local registered clients as an approximation.
 func (s *Server) handleRedisQuit(event *redis.Event) {
 	originPod := redisStr(event.Data, "pod_id")
 	if originPod == s.RedisClient.PodID() {
@@ -1155,8 +1194,6 @@ func (s *Server) handleRedisQuit(event *redis.Event) {
 	cfg := s.getConfig()
 	quitLine := fmt.Sprintf(":%s!%s@%s QUIT :%s\r\n", remoteNick, remoteUser, cfg.Server.Host, reason)
 
-	// Send QUIT to all local clients that share a channel with the remote client.
-	// We broadcast to everyone for simplicity since we don't track remote clients locally.
 	s.ClientsMutex.Lock()
 	for i := range s.Clients {
 		if s.Clients[i].conn != nil {

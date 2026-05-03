@@ -679,6 +679,34 @@ func (c *Client) SetChannelTopic(ctx context.Context, channelName, topic string)
 	return c.rdb.Set(ctx, channelKey, data, 0).Err()
 }
 
+// SetChannelModes persists the mode string for a channel.
+func (c *Client) SetChannelModes(ctx context.Context, channelName, modes string) error {
+	channelKey := fmt.Sprintf("channel:%s", channelName)
+	dataStr, err := c.rdb.Get(ctx, channelKey).Result()
+
+	var channel ChannelData
+	if err == redis.Nil {
+		channel = ChannelData{
+			Name:    channelName,
+			Modes:   modes,
+			Members: map[string]bool{},
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to get channel: %w", err)
+	} else {
+		if err2 := json.Unmarshal([]byte(dataStr), &channel); err2 != nil {
+			return fmt.Errorf("failed to unmarshal channel: %w", err2)
+		}
+		channel.Modes = modes
+	}
+
+	data, err := json.Marshal(channel)
+	if err != nil {
+		return fmt.Errorf("failed to marshal channel: %w", err)
+	}
+	return c.rdb.Set(ctx, channelKey, data, 0).Err()
+}
+
 // HydrateChannels loads persisted channels from Redis and returns them.
 // It returns channel name -> ChannelData for channels that have at least a topic set.
 func (c *Client) HydrateChannels(ctx context.Context) ([]ChannelData, error) {
