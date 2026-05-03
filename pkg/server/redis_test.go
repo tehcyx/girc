@@ -15,7 +15,7 @@ import (
 
 // makeRedisServer creates a test server backed by miniredis.
 // It starts the Redis event subscription goroutine and registers cleanup.
-func makeRedisServer(t *testing.T, cfg *testServerConfig, mr *miniredis.Miniredis, podID string) (*Server, string) {
+func makeRedisServer(t *testing.T, mr *miniredis.Miniredis, podID string) (*Server, string) {
 	t.Helper()
 
 	scfg := testConfig()
@@ -69,9 +69,6 @@ func makeRedisServer(t *testing.T, cfg *testServerConfig, mr *miniredis.Miniredi
 	return srv, ln.Addr().String()
 }
 
-// testServerConfig is a placeholder to make the helper signature clear.
-type testServerConfig struct{}
-
 // TestRedisCrossPodPrivmsg verifies that a PRIVMSG received from another pod via
 // Redis pub/sub is delivered to the local client (simulating distributed mode).
 func TestRedisCrossPodPrivmsg(t *testing.T) {
@@ -82,7 +79,7 @@ func TestRedisCrossPodPrivmsg(t *testing.T) {
 	defer mr.Close()
 
 	// Server B (pod-B) is the receiver.
-	srvB, addrB := makeRedisServer(t, nil, mr, "pod-B")
+	srvB, addrB := makeRedisServer(t, mr, "pod-B")
 
 	// Connect a client to srvB.
 	conn, err := net.DialTimeout("tcp", addrB, 5*time.Second)
@@ -126,7 +123,7 @@ func TestRedisCrossPodNick(t *testing.T) {
 	}
 	defer mr.Close()
 
-	srvB, addrB := makeRedisServer(t, nil, mr, "pod-B")
+	srvB, addrB := makeRedisServer(t, mr, "pod-B")
 
 	conn, err := net.DialTimeout("tcp", addrB, 5*time.Second)
 	if err != nil {

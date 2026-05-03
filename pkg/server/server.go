@@ -196,13 +196,8 @@ func New() {
 	log.Println("Graceful shutdown complete")
 }
 
-// getConfig returns the server's active configuration, falling back to the
-// package-level global when the server has no local config set.
 func (s *Server) getConfig() *config.Config {
-	if s.cfg != nil {
-		return s.cfg
-	}
-	return config.Values
+	return s.cfg
 }
 
 func (s *Server) initRooms() {
