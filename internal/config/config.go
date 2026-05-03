@@ -2,32 +2,142 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
-	"log"
 	"os"
-	"os/user"
+	"strings"
 
+	log "github.com/sirupsen/logrus"
 	yaml "gopkg.in/yaml.v3"
 )
 
+// Values holds the active server configuration. Populated by Load() or init() for compatibility.
 var Values *Config
 
+// Config is the top-level configuration structure.
 type Config struct {
 	Server struct {
-		Name  string `yaml:"name"`
-		Host  string `yaml:"host"`
-		Port  string `yaml:"port"`
-		Motd  string `yaml:"motd"`
-		Debug bool   `yaml:"debug"` // Enable debug logging
+		Name                string `yaml:"name"`
+		Host                string `yaml:"host"`
+		Port                string `yaml:"port"`
+		Motd                string `yaml:"motd"`
+		Debug               bool   `yaml:"debug"`
+		DefaultChannelModes string `yaml:"default_channel_modes"` // e.g. "+nt"
 	}
 	Auth struct {
 		UsersFile string `yaml:"usersfile"`
 	}
 	Redis struct {
-		Enabled bool   `yaml:"enabled"` // Enable distributed mode with Redis
-		URL     string `yaml:"url"`     // Redis connection URL (e.g., redis://localhost:6379)
-		PodID   string `yaml:"pod_id"`  // Unique identifier for this pod (auto-generated if empty)
+		Enabled bool   `yaml:"enabled"`
+		URL     string `yaml:"url"`
+		PodID   string `yaml:"pod_id"`
 	}
+}
+
+// Load reads configuration from ~/.girc/conf.yaml if available, then applies
+// environment variable overrides. It never panics: if the home directory is
+// unavailable (e.g. FROM scratch containers) it silently falls back to
+// defaults + env vars.
+func Load() (*Config, error) {
+	c := &Config{}
+
+	// Apply built-in defaults first.
+	c.Server.Name = "girc"
+	c.Server.Host = "localhost"
+	c.Server.Port = "6667"
+	c.Server.Motd = "Find out more on github.com/tehcyx/girc"
+	c.Server.Debug = false
+	c.Server.DefaultChannelModes = "+nt"
+	c.Redis.URL = "redis://localhost:6379"
+
+	// Try to load from ~/.girc/conf.yaml; skip silently if unavailable.
+	if cfgPath := configFilePath(); cfgPath != "" {
+		if data, err := os.ReadFile(cfgPath); err == nil {
+			if err2 := yaml.Unmarshal(data, c); err2 != nil {
+				log.Warnf("config: failed to parse %s: %v", cfgPath, err2)
+			}
+		}
+		// If the file doesn't exist that's fine — use defaults.
+	}
+
+	// Environment variables override yaml values.
+	applyEnv(c)
+
+	return c, nil
+}
+
+// configFilePath returns the path to the config file, or "" if the home dir
+// cannot be determined (e.g. running as scratch container without /etc/passwd).
+func configFilePath() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return ""
+	}
+	dir := home + string(os.PathSeparator) + ".girc" + string(os.PathSeparator)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return ""
+	}
+	cfgPath := dir + "conf.yaml"
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		// Write default config.
+		defaultConfig := `server:
+    host: "localhost"
+    port: "6667"
+    name: "girc"
+    motd: "Find out more on github.com/tehcyx/girc"
+    debug: false
+    default_channel_modes: "+nt"
+redis:
+    enabled: false
+    url: "redis://localhost:6379"
+    pod_id: ""
+`
+		_ = os.WriteFile(cfgPath, []byte(defaultConfig), 0600)
+	}
+	return cfgPath
+}
+
+// applyEnv overlays environment variable values on top of parsed config.
+// Environment variables always win over yaml values.
+func applyEnv(c *Config) {
+	if v := os.Getenv("IRC_PORT"); v != "" {
+		c.Server.Port = v
+	}
+	if v := os.Getenv("IRC_HOST"); v != "" {
+		c.Server.Host = v
+	}
+	if v := os.Getenv("SERVER_NAME"); v != "" {
+		c.Server.Name = v
+	}
+	if v := os.Getenv("MOTD_FILE"); v != "" {
+		if data, err := os.ReadFile(v); err == nil {
+			c.Server.Motd = strings.TrimSpace(string(data))
+		} else {
+			log.Warnf("config: MOTD_FILE %s: %v", v, err)
+		}
+	}
+	if v := os.Getenv("REDIS_ENABLED"); v == "true" || v == "1" {
+		c.Redis.Enabled = true
+	}
+	if v := os.Getenv("REDIS_URL"); v != "" {
+		c.Redis.URL = v
+	}
+	if v := os.Getenv("REDIS_POD_ID"); v != "" {
+		c.Redis.PodID = v
+	}
+	if v := os.Getenv("DEFAULT_CHANNEL_MODES"); v != "" {
+		c.Server.DefaultChannelModes = v
+	}
+}
+
+// init is kept so that packages that import config get a usable Values without
+// calling Load(). It uses Load() internally so no duplication.
+func init() {
+	cfg, err := Load()
+	if err != nil {
+		// Should not happen; Load() never returns a hard error.
+		log.Warnf("config: Load() failed: %v", err)
+		cfg = &Config{}
+	}
+	Values = cfg
 }
 
 // User represents an authenticated user with permissions
@@ -35,7 +145,7 @@ type User struct {
 	Username string   `yaml:"username"`
 	Password string   `yaml:"password"` // In production, should be hashed
 	IsOper   bool     `yaml:"isoper"`
-	Channels []string `yaml:"channels"` // Channels where user is operator
+	Channels []string `yaml:"channels"`
 }
 
 // Users holds the list of authenticated users
@@ -45,11 +155,11 @@ type Users struct {
 
 // Ban represents a banned user or hostmask
 type Ban struct {
-	Mask      string `yaml:"mask"`      // Ban mask (nick!user@host pattern)
-	Channel   string `yaml:"channel"`   // Channel where ban applies (empty for server-wide)
-	SetBy     string `yaml:"setby"`     // Who set the ban
-	Reason    string `yaml:"reason"`    // Ban reason
-	Timestamp int64  `yaml:"timestamp"` // Unix timestamp when ban was set
+	Mask      string `yaml:"mask"`
+	Channel   string `yaml:"channel"`
+	SetBy     string `yaml:"setby"`
+	Reason    string `yaml:"reason"`
+	Timestamp int64  `yaml:"timestamp"`
 }
 
 // Bans holds the list of bans
@@ -57,70 +167,31 @@ type Bans struct {
 	Bans []Ban `yaml:"bans"`
 }
 
-func getConf() *Config {
-	c := &Config{}
-	osUser, err := user.Current()
-	if err != nil {
-		panic(err)
+// usersFilePath returns the path for the users file, or "" on error.
+func usersFilePath(custom string) string {
+	if custom != "" {
+		return custom
 	}
-	userHome := osUser.HomeDir
-
-	configDir := fmt.Sprintf("%s%s.girc%s", userHome, string(os.PathSeparator), string(os.PathSeparator))
-	if _, err := os.Stat(configDir); os.IsNotExist(err) {
-		os.Mkdir(configDir, os.ModeDir)
+	home := os.Getenv("HOME")
+	if home == "" {
+		return ""
 	}
-	confPath := fmt.Sprintf("%sconf.yaml", configDir)
-	if _, err := os.Stat(confPath); os.IsNotExist(err) {
-		defaultConfig := `server:
-    host: "localhost"
-    port: "6665"
-    name: "daniels server"
-    motd: "Find out more on github.com/tehcyx/girc"
-    debug: false  # Enable debug logging (shows detailed protocol messages)
-redis:
-    enabled: false
-    url: "redis://localhost:6379"
-    pod_id: ""  # Auto-generated if empty
-`
-		ioutil.WriteFile(confPath, []byte(defaultConfig), os.ModeAppend)
-	}
-
-	yamlFile, err := ioutil.ReadFile(confPath)
-	if err != nil {
-		log.Printf("yamlFile.Get err   #%v ", err)
-	}
-	err = yaml.Unmarshal(yamlFile, c)
-	if err != nil {
-		log.Fatalf("Unmarshal: %v", err)
-	}
-	return c
-}
-
-func init() {
-	Values = getConf()
+	return fmt.Sprintf("%s%s.girc%susers.yaml", home, string(os.PathSeparator), string(os.PathSeparator))
 }
 
 // LoadUsers loads the users from the configured users file
 func LoadUsers() (*Users, error) {
-	osUser, err := user.Current()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current user: %w", err)
-	}
-	userHome := osUser.HomeDir
-
-	// Default to users.yaml in .girc directory
-	usersFile := Values.Auth.UsersFile
+	usersFile := usersFilePath(Values.Auth.UsersFile)
 	if usersFile == "" {
-		usersFile = fmt.Sprintf("%s%s.girc%susers.yaml", userHome, string(os.PathSeparator), string(os.PathSeparator))
+		return &Users{Users: []User{}}, nil
 	}
 
-	// Create default users file if it doesn't exist
 	if _, err := os.Stat(usersFile); os.IsNotExist(err) {
 		defaultUsers := &Users{
 			Users: []User{
 				{
 					Username: "admin",
-					Password: "admin", // In production, use hashed passwords
+					Password: "admin",
 					IsOper:   true,
 					Channels: []string{},
 				},
@@ -131,8 +202,7 @@ func LoadUsers() (*Users, error) {
 		}
 	}
 
-	// Read users file
-	data, err := ioutil.ReadFile(usersFile)
+	data, err := os.ReadFile(usersFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read users file: %w", err)
 	}
@@ -145,31 +215,26 @@ func LoadUsers() (*Users, error) {
 	return users, nil
 }
 
-// SaveUsers saves users to the configured users file
+// SaveUsers saves users to the given filepath
 func SaveUsers(users *Users, filepath string) error {
 	data, err := yaml.Marshal(users)
 	if err != nil {
 		return fmt.Errorf("failed to marshal users: %w", err)
 	}
-
-	if err := ioutil.WriteFile(filepath, data, 0600); err != nil {
+	if err := os.WriteFile(filepath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write users file: %w", err)
 	}
-
 	return nil
 }
 
 // LoadBans loads the bans from the bans file
 func LoadBans() (*Bans, error) {
-	osUser, err := user.Current()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current user: %w", err)
+	home := os.Getenv("HOME")
+	if home == "" {
+		return &Bans{Bans: []Ban{}}, nil
 	}
-	userHome := osUser.HomeDir
+	bansFile := fmt.Sprintf("%s%s.girc%sbans.yaml", home, string(os.PathSeparator), string(os.PathSeparator))
 
-	bansFile := fmt.Sprintf("%s%s.girc%sbans.yaml", userHome, string(os.PathSeparator), string(os.PathSeparator))
-
-	// Create empty bans file if it doesn't exist
 	if _, err := os.Stat(bansFile); os.IsNotExist(err) {
 		defaultBans := &Bans{Bans: []Ban{}}
 		if err := SaveBans(defaultBans, bansFile); err != nil {
@@ -177,8 +242,7 @@ func LoadBans() (*Bans, error) {
 		}
 	}
 
-	// Read bans file
-	data, err := ioutil.ReadFile(bansFile)
+	data, err := os.ReadFile(bansFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read bans file: %w", err)
 	}
@@ -197,11 +261,9 @@ func SaveBans(bans *Bans, filepath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal bans: %w", err)
 	}
-
-	if err := ioutil.WriteFile(filepath, data, 0600); err != nil {
+	if err := os.WriteFile(filepath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write bans file: %w", err)
 	}
-
 	return nil
 }
 
@@ -215,19 +277,13 @@ func AuthenticateUser(username, password string, users *Users) (*User, bool) {
 	return nil, false
 }
 
-// IsBanned checks if a user mask is banned (either server-wide or in a specific channel)
-// mask should be in format: nick!user@host
-// channel should be the channel name (or empty string to check only server-wide bans)
+// IsBanned checks if a user mask is banned
 func IsBanned(mask, channel string, bans *Bans) (bool, *Ban) {
 	for i := range bans.Bans {
 		ban := &bans.Bans[i]
-
-		// Check if this ban applies (server-wide or channel-specific)
 		if ban.Channel != "" && ban.Channel != channel {
-			continue // This ban is for a different channel
+			continue
 		}
-
-		// Check if mask matches the ban pattern
 		if matchBanMask(mask, ban.Mask) {
 			return true, ban
 		}
@@ -235,25 +291,17 @@ func IsBanned(mask, channel string, bans *Bans) (bool, *Ban) {
 	return false, nil
 }
 
-// matchBanMask checks if a user mask matches a ban mask pattern
-// Supports wildcards: * (any characters) and ? (single character)
-// Example patterns: *!*@badhost.com, baduser!*@*, nick!user@host
 func matchBanMask(userMask, banPattern string) bool {
 	return wildcardMatch(userMask, banPattern)
 }
 
-// wildcardMatch performs wildcard pattern matching
 func wildcardMatch(text, pattern string) bool {
-	// Simple implementation - in production, use a more robust glob matcher
 	if pattern == "*" {
 		return true
 	}
-
-	// Convert pattern to simple matching
 	ti, pi := 0, 0
 	star := -1
 	match := 0
-
 	for ti < len(text) {
 		if pi < len(pattern) && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
 			ti++
@@ -270,11 +318,8 @@ func wildcardMatch(text, pattern string) bool {
 			return false
 		}
 	}
-
-	// Handle remaining wildcards in pattern
 	for pi < len(pattern) && pattern[pi] == '*' {
 		pi++
 	}
-
 	return pi == len(pattern)
 }
