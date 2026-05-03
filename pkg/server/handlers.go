@@ -241,6 +241,13 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 			if client.user == "" {
 				client.user = "*"
 			}
+			// Complete registration if USER was already received.
+			if client.user != "" && client.user != "*" && !client.registered {
+				log.Infof("NICK: USER already set, completing registration for nick='%s'", client.nick)
+				s.AddClient(*client)
+				client.registered = true
+				log.Infof("NICK: Registration completed (USER-then-NICK order)")
+			}
 		}
 		return true
 	} else if cmd == UserCmd && !client.registered {
@@ -363,18 +370,26 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 				// ERR_TOOMANYTARGETS
 			} else {
 				if inChannel, room := s.IsUserInRoom(*client, target); inChannel {
+					// Snapshot member IDs under roomMux, then send under ClientsMutex.
 					room.roomMux.Lock()
+					memberIDs := make([]uuid.UUID, 0, len(room.clients))
 					for ident := range room.clients {
-						if ident == client.identifier {
-							continue
-						}
-						for _, cli := range s.Clients {
-							if ident == cli.identifier {
-								send(cli.conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, s.getConfig().Server.Host, PrivmsgCmd, target, chatMessage)
-							}
+						if ident != client.identifier {
+							memberIDs = append(memberIDs, ident)
 						}
 					}
 					room.roomMux.Unlock()
+
+					s.ClientsMutex.Lock()
+					for _, ident := range memberIDs {
+						for i := range s.Clients {
+							if s.Clients[i].identifier == ident {
+								send(s.Clients[i].conn, ":%s!%s@%s %s %s :%s\n", client.nick, client.user, s.getConfig().Server.Host, PrivmsgCmd, target, chatMessage)
+								break
+							}
+						}
+					}
+					s.ClientsMutex.Unlock()
 
 					// Publish to Redis for cross-pod delivery.
 					if s.RedisClient != nil {
@@ -472,11 +487,14 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 			}
 			s.ClientsMutex.Unlock()
 
-			// Send PART only to channel members (not all clients).
+			// Send PART to remaining channel members (exclude parting client — sent below).
 			partMsg := fmt.Sprintf(":%s!%s@%s %s %s :%s\r\n",
 				client.nick, client.user, s.getConfig().Server.Host, PartCmd, target, partMessage)
 			s.ClientsMutex.Lock()
 			for _, memberID := range memberIDs {
+				if memberID == client.identifier {
+					continue // will be sent directly below
+				}
 				for i := range s.Clients {
 					if s.Clients[i].identifier == memberID {
 						s.Clients[i].conn.Write([]byte(partMsg))
@@ -484,9 +502,9 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 					}
 				}
 			}
-			// Also send PART to the parting client themselves (they were in memberIDs before removal).
-			conn.Write([]byte(partMsg))
 			s.ClientsMutex.Unlock()
+			// Send PART to the parting client exactly once.
+			conn.Write([]byte(partMsg))
 
 			// Update Redis if enabled.
 			if s.RedisClient != nil {
@@ -680,9 +698,22 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 			return true
 		}
 
-		// Perform the kick - notify all channel members
+		// Snapshot member IDs under roomMux, then send under ClientsMutex.
 		room.roomMux.Lock()
+		kickMemberIDs := make([]uuid.UUID, 0, len(room.clients))
 		for memberID := range room.clients {
+			kickMemberIDs = append(kickMemberIDs, memberID)
+		}
+		// Remove target from channel while still holding roomMux.
+		delete(room.clients, targetClient.identifier)
+		if room.operators != nil {
+			delete(room.operators, targetClient.identifier)
+		}
+		room.roomMux.Unlock()
+
+		// Perform the kick - notify all channel members (including the kicked user).
+		s.ClientsMutex.Lock()
+		for _, memberID := range kickMemberIDs {
 			for i := range s.Clients {
 				if s.Clients[i].identifier == memberID {
 					send(s.Clients[i].conn, ":%s!%s@%s KICK %s %s :%s\n",
@@ -692,13 +723,7 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 				}
 			}
 		}
-
-		// Remove target from channel
-		delete(room.clients, targetClient.identifier)
-		if room.operators != nil {
-			delete(room.operators, targetClient.identifier)
-		}
-		room.roomMux.Unlock()
+		s.ClientsMutex.Unlock()
 
 		// Remove channel from target's room list
 		s.ClientsMutex.Lock()
@@ -1987,12 +2012,22 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 					for i := range s.Clients {
 						if room.clients[s.Clients[i].identifier] {
 							send(s.Clients[i].conn, ":%s!%s@%s MODE %s %s%s\n",
-								client.nick, client.user, "localhost", room.name, modeChange, modeArgsStr)
+								client.nick, client.user, s.getConfig().Server.Host, room.name, modeChange, modeArgsStr)
 						}
 					}
 					s.ClientsMutex.Unlock()
 
 					log.Infof("[MODE] %s set modes on %s: %s%s", client.nick, room.name, modeChange, modeArgsStr)
+
+					// Persist updated mode string to Redis.
+					if s.RedisClient != nil {
+						fullModeStr := roomModeString(room)
+						ctx := context.Background()
+						channelKey := "#" + room.name
+						if err := s.RedisClient.SetChannelModes(ctx, channelKey, fullModeStr); err != nil {
+							log.Errorf("[MODE] Failed to persist modes for %s: %v", room.name, err)
+						}
+					}
 				}
 			}
 		} else {
