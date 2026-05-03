@@ -1085,20 +1085,29 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 				} else {
 					// Send to channel
 					if inChannel, room := s.IsUserInRoom(*client, target); inChannel {
+						// A5: Snapshot member IDs under roomMux, then send under ClientsMutex.
+						// Iterating s.Clients without ClientsMutex races with AddClient/RemoveClient.
 						room.roomMux.Lock()
+						memberIDs := make([]uuid.UUID, 0, len(room.clients))
 						for ident := range room.clients {
-							if ident == client.identifier {
-								continue // Don't send to sender
-							}
-							for _, cli := range s.Clients {
-								if ident == cli.identifier {
-									send(cli.conn, ":%s!%s@%s %s %s :%s\n",
-										client.nick, client.user, s.getConfig().Server.Host,
-										NoticeCmd, target, noticeMessage)
-								}
+							if ident != client.identifier {
+								memberIDs = append(memberIDs, ident)
 							}
 						}
 						room.roomMux.Unlock()
+
+						s.ClientsMutex.Lock()
+						for _, ident := range memberIDs {
+							for i := range s.Clients {
+								if s.Clients[i].identifier == ident {
+									send(s.Clients[i].conn, ":%s!%s@%s %s %s :%s\n",
+										client.nick, client.user, s.getConfig().Server.Host,
+										NoticeCmd, target, noticeMessage)
+									break
+								}
+							}
+						}
+						s.ClientsMutex.Unlock()
 						log.Infof("[NOTICE] %s sent notice to channel %s", client.nick, target)
 					} else {
 						// NOTICE should fail silently - user not in channel
@@ -1863,7 +1872,8 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 					modeStr.WriteString("p")
 				}
 
-				send(conn, ":%s %s %s %s %s\n",
+				// A1: IRC clients expect the channel name with # prefix in MODE reply.
+				send(conn, ":%s %s %s #%s %s\n",
 					s.getConfig().Server.Host, RplChannelModeIs, client.nick, room.name, modeStr.String())
 				log.Infof("[MODE] %s queried modes for %s: %s", client.nick, room.name, modeStr.String())
 			} else {
@@ -1990,6 +2000,12 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 						}
 					}
 				}
+
+				// Capture fields we need after unlock while still holding RoomsMutex.
+				// A3: roomModeString reads room flags — call it here, under the lock.
+				bcastRoomName := room.name
+				bcastRoomClients := room.clients
+				fullModeStr := roomModeString(room)
 				s.RoomsMutex.Unlock()
 
 				// Broadcast mode change to all channel members
@@ -2002,22 +2018,22 @@ func (s *Server) handleCommand(client *Client, conn net.Conn, cmd, args string) 
 
 					s.ClientsMutex.Lock()
 					for i := range s.Clients {
-						if room.clients[s.Clients[i].identifier] {
-							send(s.Clients[i].conn, ":%s!%s@%s MODE %s %s%s\n",
-								client.nick, client.user, s.getConfig().Server.Host, room.name, modeChange, modeArgsStr)
+						if bcastRoomClients[s.Clients[i].identifier] {
+							// A1: IRC clients expect the channel name with # prefix in MODE.
+							send(s.Clients[i].conn, ":%s!%s@%s MODE #%s %s%s\n",
+								client.nick, client.user, s.getConfig().Server.Host, bcastRoomName, modeChange, modeArgsStr)
 						}
 					}
 					s.ClientsMutex.Unlock()
 
-					log.Infof("[MODE] %s set modes on %s: %s%s", client.nick, room.name, modeChange, modeArgsStr)
+					log.Infof("[MODE] %s set modes on %s: %s%s", client.nick, bcastRoomName, modeChange, modeArgsStr)
 
 					// Persist updated mode string to Redis.
 					if s.RedisClient != nil {
-						fullModeStr := roomModeString(room)
 						ctx := context.Background()
-						channelKey := "#" + room.name
+						channelKey := "#" + bcastRoomName
 						if err := s.RedisClient.SetChannelModes(ctx, channelKey, fullModeStr); err != nil {
-							log.Errorf("[MODE] Failed to persist modes for %s: %v", room.name, err)
+							log.Errorf("[MODE] Failed to persist modes for %s: %v", bcastRoomName, err)
 						}
 					}
 				}
