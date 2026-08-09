@@ -34,20 +34,24 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
     - uses: actions/checkout@v7
+    - uses: docker/setup-buildx-action@v3
     - name: Log in to GitHub Container Registry
       uses: docker/login-action@v4
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build Docker image
-      run: |
-        make docker
-        docker build -t girc .
-    - name: Tag and push image
-      run: |
-        commit=$(git rev-parse HEAD)
-        docker tag girc:latest ghcr.io/${{ github.repository }}/app:latest
-        docker tag girc:latest "ghcr.io/${{ github.repository }}/app:${commit}"
-        docker push ghcr.io/${{ github.repository }}/app:latest
-        docker push "ghcr.io/${{ github.repository }}/app:${commit}"
+    - uses: docker/metadata-action@v5
+      id: meta
+      with:
+        images: ghcr.io/${{ github.repository }}/app
+        tags: |
+          type=sha,prefix=commit-
+    - uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/amd64,linux/arm64
+        provenance: false
