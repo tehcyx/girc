@@ -47,7 +47,7 @@ jobs:
         images: ghcr.io/${{ github.repository }}/app
         tags: |
           type=sha,prefix=commit-
-    - uses: docker/build-push-action@v6
+    - uses: docker/build-push-action@v7
       with:
         context: .
         push: true
